@@ -136,14 +136,14 @@ jobs:
           Name=Persian Keyboard Layout
           DESKTOP
 
-          # شورت‌کات اجرای مرورگر کروم روی دسکتاپ
+          # شورت‌کات اجرای مرورگر کروم روی دسکتاپ با حداکثر بهره‌گیری از هسته‌های پردازنده و وب‌جی‌ال نرم‌افزاری
           cat <<'DESKTOP' > /home/runner/kasm_data/Desktop/google-chrome.desktop
           [Desktop Entry]
           Version=1.0
           Type=Application
           Name=Google Chrome
           Comment=Access the Internet
-          Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage %U
+          Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --num-raster-threads=4 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader %U
           Icon=google-chrome
           Path=/config
           Terminal=false
@@ -151,11 +151,11 @@ jobs:
           DESKTOP
           chmod +x /home/runner/kasm_data/Desktop/google-chrome.desktop
 
-          # اجرای خودکار مرورگر کروم هنگام بالا آمدن دسکتاپ
+          # اجرای خودکار مرورگر کروم هنگام بالا آمدن دسکتاپ با تنظیمات رندرینگ تقویت‌شده
           cat <<'DESKTOP' > /home/runner/kasm_data/.config/autostart/chrome.desktop
           [Desktop Entry]
           Type=Application
-          Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage
+          Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --num-raster-threads=4 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader
           Hidden=false
           NoDisplay=false
           X-GNOME-Autostart-enabled=true
