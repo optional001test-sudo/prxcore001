@@ -65,7 +65,7 @@ jobs:
 
           # === تنظیمات Window Scaling و ریکاوری بلادرنگ پکت‌ها ===
           net.ipv4.tcp_window_scaling = 1
-          net.ipv4.tcp_adv_win_scale = -2
+          net.ipv4.tcp_adv_win_scale = 1
           net.ipv4.tcp_sack = 1
           net.ipv4.tcp_dsack = 1
           net.ipv4.tcp_timestamps = 1
