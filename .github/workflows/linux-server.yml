@@ -101,14 +101,16 @@ jobs:
 
       - name: 2. Setup Secure User, Dependencies & Deploy Extreme Webtop XFCE Desktop
         run: |
-          sudo useradd -m -s /bin/bash prxcore
+          id -u prxcore &>/dev/null || sudo useradd -m -s /bin/bash prxcore
           echo "prxcore:$PRX_USER_PASS" | sudo chpasswd
           sudo usermod -aG sudo prxcore
           echo "prxcore ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/prxcore > /dev/null
 
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            neofetch htop tmux curl wget unzip nginx qrencode jq -qq
+            htop tmux curl wget unzip nginx qrencode jq -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y fastfetch -qq 2>/dev/null || \
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y neofetch -qq 2>/dev/null || true
 
           # دانلود ttyd
           sudo wget -q -nc https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -O /usr/local/bin/ttyd
@@ -137,14 +139,14 @@ jobs:
           Name=Persian Keyboard Layout
           DESKTOP
 
-          # شورت‌کات اجرای مرورگر کروم روی دسکتاپ با حداکثر بهره‌گیری از هسته‌های پردازنده و وب‌جی‌ال نرم‌افزاری
+          # شورت‌کات اجرای مرورگر کروم روی دسکتاپ (همراه با --password-store=basic جهت حذف پاپ‌آپ Keyring)
           cat <<'DESKTOP' > /home/runner/kasm_data/Desktop/google-chrome.desktop
           [Desktop Entry]
           Version=1.0
           Type=Application
           Name=Google Chrome
           Comment=Access the Internet
-          Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --num-raster-threads=4 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader %U
+          Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --password-store=basic --num-raster-threads=4 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader %U
           Icon=google-chrome
           Path=/config
           Terminal=false
@@ -156,7 +158,7 @@ jobs:
           cat <<'DESKTOP' > /home/runner/kasm_data/.config/autostart/chrome.desktop
           [Desktop Entry]
           Type=Application
-          Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --num-raster-threads=4 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader
+          Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --password-store=basic --num-raster-threads=4 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader
           Hidden=false
           NoDisplay=false
           X-GNOME-Autostart-enabled=true
@@ -193,8 +195,10 @@ jobs:
             rm -f /tmp/chrome.deb
           " 2>/dev/null || true
 
-          sudo docker exec -u 1000 kasm-chrome bash -c "
+          # اعمال نقشه کیبورد و اجرای خودکار کروم پس از نصب در محیط دسکتاپ
+          sudo docker exec -u 1000 -e DISPLAY=:1 kasm-chrome bash -c "
             setxkbmap -layout 'us,ir' -option 'grp:alt_shift_toggle' 2>/dev/null || true
+            pgrep -f google-chrome >/dev/null || nohup /usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --password-store=basic --num-raster-threads=4 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader >/dev/null 2>&1 &
           " 2>/dev/null || true
 
           echo "✅ میزکار XFCE همراه با Google Chrome و پشتیبانی کامل کیبورد فارسی مستقر شدند."
@@ -277,14 +281,10 @@ jobs:
                     "heartbeatPeriod": 15
                   },
                   "sockopt": {
-                    "mark": 255,
                     "tcpFastOpen": true,
                     "tcpNoDelay": true,
                     "tcpKeepAliveInterval": 10,
-                    "tcpKeepAliveIdle": 15,
-                    "tcpMptcp": false,
-                    "tcpCongestion": "bbr",
-                    "domainStrategy": "UseIPv4"
+                    "tcpKeepAliveIdle": 15
                   }
                 },
                 "sniffing": {
@@ -303,7 +303,6 @@ jobs:
                 },
                 "streamSettings": {
                   "sockopt": {
-                    "mark": 255,
                     "tcpFastOpen": true,
                     "tcpNoDelay": true,
                     "tcpCongestion": "bbr"
@@ -451,6 +450,10 @@ jobs:
               }
 
               # === ۲. مسیر وب‌ترمینال لینوکس (ttyd) ===
+              location = /terminal {
+                  return 301 /terminal/;
+              }
+
               location ^~ /terminal/ {
                   proxy_pass http://ttyd_backend;
                   proxy_http_version 1.1;
@@ -506,8 +509,8 @@ jobs:
 
       - name: 5. Launch Services & Cloudflare Tunnel (Stable HTTP/2 Engine)
         run: |
-          # اجرای ttyd روی پورت 7681 با پیشوند مسیر /terminal
-          sudo nohup /usr/local/bin/ttyd \
+          # اجرای ttyd روی پورت 7681 با کاربر prxcore و پیشوند مسیر /terminal
+          sudo -u prxcore nohup /usr/local/bin/ttyd \
             -c "prxcore:$PRX_USER_PASS" \
             -W \
             -p 7681 \
@@ -546,7 +549,7 @@ jobs:
             exit 1
           fi
 
-      - name: 6. Generate Connection Info & 6-Hour Keep Alive
+      - name: 6. Generate Connection Info & Keep Alive (Safe Margin Before Timeout)
         run: |
           VLESS_LINK="vless://$PRX_UUID@$PRX_DOMAIN:443?path=%2Fprx-stream&security=tls&encryption=none&type=ws&sni=$PRX_DOMAIN&host=$PRX_DOMAIN&alpn=h2%2Chttp%2F1.1&fp=chrome#PRX-Ultra"
 
@@ -565,51 +568,57 @@ jobs:
           echo "║    ✅ Full XFCE Desktop + Native X11 Key Mapping        ║"
           echo "║    ✅ Dual Language Keyboard (English + Persian)         ║"
           echo "║    ✅ Toggle Shortcut: Alt + Shift                       ║"
-          echo "║    ✅ Google Chrome Official Stable Engine Installed     ║"
+          echo "║    ✅ Google Chrome Official Stable (Keyring Bypassed)   ║"
           echo "║    ✅ Persian Standard Fonts (Vazirmatn / FarsiWeb)     ║"
           echo "║    ✅ 8GB Shared RAM (shm) + Host IPC Mode              ║"
           echo "║    ✅ BBR Congestion Control + 64MB Massive Buffers     ║"
-          echo "║    ✅ Cloud Session Persistence (Auto Cookies/Logins)   ║"
+          echo "║    ✅ Guaranteed Auto-Save Cache Before 6h Cutoff        ║"
           echo "╠══════════════════════════════════════════════════════════╣"
           echo "║  🚀 VLESS Connection Link:                              ║"
           echo "╚══════════════════════════════════════════════════════════╝"
           echo ""
           echo "$VLESS_LINK"
           echo ""
-          echo "⏱️ سرور تا ۶ ساعت فعال می‌ماند..."
+          echo "⏱️ سرور تا ۵ ساعت و ۴۵ دقیقه فعال می‌ماند و سپس ۱۵ دقیقه صرف ذخیره امن کوکی‌ها می‌شود..."
           echo "=================================================="
 
-          for i in $(seq 1 360); do
+          # ۳۴۵ دقیقه (۵ ساعت و ۴۵ دقیقه) جهت تضمین اجرای کامل مراحل ۷ و ۸ قبل از سقف ۳۶۰ دقیقه‌ای گیت‌هاب
+          for i in $(seq 1 345); do
             sleep 60
             if [ $((i % 10)) -eq 0 ]; then
               CF_UP=$(pgrep -c -f "cloudflared" 2>/dev/null || echo "0")
               XRAY_UP=$(pgrep -c -f "xray" 2>/dev/null || echo "0")
               KASM_UP=$(sudo docker inspect -f '{{.State.Running}}' kasm-chrome 2>/dev/null || echo "false")
-              echo "[$i/360] 📊 Status: Proto=HTTP/2 | CF=$CF_UP | Xray=$XRAY_UP | Kasm=$KASM_UP"
+              echo "[$i/345] 📊 Status: Proto=HTTP/2 | CF=$CF_UP | Xray=$XRAY_UP | Kasm=$KASM_UP"
             else
-              echo "[$i/360] 🟢 Running on $PRX_DOMAIN (HTTP/2 Stable)"
+              echo "[$i/345] 🟢 Running on $PRX_DOMAIN (HTTP/2 Stable)"
             fi
           done
-          echo "⏰ ۶ ساعت تمام شد. سرور خاموش می‌شود."
+          echo "⏰ زمان کاری به پایان رسید. در حال ذخیره ایمن کوکی‌ها و پروفایل..."
 
-      # === ۷. متوقف کردن ایمن کانتینر برای ذخیره نهایی کوکی‌ها و پاکسازی موقت‌ها ===
+      # === ۷. متوقف کردن ایمن کانتینر برای ذخیره نهایی کوکی‌ها و پاکسازی کش‌های حجیم و موقت ===
       - name: 7. Gracefully Stop Browser & Clean Sockets
         if: always()
         run: |
           echo "⏹️ متوقف کردن ایمن کانتینر برای ثبت نهایی کوکی‌ها..."
           sudo docker stop kasm-chrome -t 10 2>/dev/null || true
           
-          # حذف فایل‌های موقت، قفل‌ها و سوکت‌های لینوکسی که مانع کش شدن می‌شوند
+          # حذف فایل‌های موقت، قفل‌ها، سوکت‌ها و کش‌های حجیم کروم (با حفظ کامل کوکی‌ها، پسوردها و افزونه‌ها)
           sudo rm -rf /home/runner/kasm_data/.cache \
                       /home/runner/kasm_data/Singleton* \
                       /home/runner/kasm_data/.config/google-chrome/Singleton* \
+                      /home/runner/kasm_data/.config/google-chrome/Default/Cache \
+                      /home/runner/kasm_data/.config/google-chrome/Default/Code\ Cache \
+                      /home/runner/kasm_data/.config/google-chrome/Default/GPUCache \
+                      /home/runner/kasm_data/.config/google-chrome/Default/Service\ Worker/CacheStorage \
+                      /home/runner/kasm_data/.config/google-chrome/ShaderCache \
                       /home/runner/kasm_data/.X11-unix \
                       /home/runner/kasm_data/tmp 2>/dev/null || true
           
           # آزادسازی دسترسی کامل جهت ساخت آرشیو کش
           sudo chown -R runner:docker /home/runner/kasm_data
           sudo chmod -R 777 /home/runner/kasm_data
-          echo "✅ داده‌های پروفایل با موفقیت آماده ذخیره‌سازی شدند."
+          echo "✅ داده‌های پروفایل با موفقیت فشرده و آماده ذخیره‌سازی شدند."
 
       # === ۸. ذخیره‌سازی آرشیو سشن‌ها و کوکی‌ها در گیت‌هاب ===
       - name: 8. Save Persistent Browser Profile & Cookies
