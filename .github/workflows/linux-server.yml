@@ -276,15 +276,11 @@ jobs:
                 "streamSettings": {
                   "network": "ws",
                   "wsSettings": {
-                    "path": "/prx-stream",
-                    "host": "$PRX_DOMAIN",
-                    "heartbeatPeriod": 15
+                    "path": "/prx-stream"
                   },
                   "sockopt": {
                     "tcpFastOpen": true,
-                    "tcpNoDelay": true,
-                    "tcpKeepAliveInterval": 10,
-                    "tcpKeepAliveIdle": 15
+                    "tcpNoDelay": true
                   }
                 },
                 "sniffing": {
@@ -406,11 +402,6 @@ jobs:
           MAIN
 
           cat <<'SITE' | sudo tee /etc/nginx/sites-available/default
-          upstream xray_backend {
-              server 127.0.0.1:8080;
-              keepalive 256;
-          }
-
           upstream ttyd_backend {
               server 127.0.0.1:7681;
               keepalive 64;
@@ -428,12 +419,15 @@ jobs:
 
               # === ۱. مسیر پروکسی فیلترشکن VLESS WS ===
               location /prx-stream {
+                  if ($http_upgrade != "websocket") {
+                      return 404;
+                  }
                   access_log off;
                   proxy_redirect off;
-                  proxy_pass http://xray_backend;
+                  proxy_pass http://127.0.0.1:8080;
                   proxy_http_version 1.1;
                   proxy_set_header Upgrade $http_upgrade;
-                  proxy_set_header Connection $connection_upgrade;
+                  proxy_set_header Connection "upgrade";
                   proxy_set_header Host $host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -551,7 +545,7 @@ jobs:
 
       - name: 6. Generate Connection Info & Keep Alive (Safe Margin Before Timeout)
         run: |
-          VLESS_LINK="vless://$PRX_UUID@$PRX_DOMAIN:443?path=%2Fprx-stream&security=tls&encryption=none&type=ws&sni=$PRX_DOMAIN&host=$PRX_DOMAIN&alpn=h2%2Chttp%2F1.1&fp=chrome#PRX-Ultra"
+          VLESS_LINK="vless://$PRX_UUID@$PRX_DOMAIN:443?path=%2Fprx-stream%3Fed%3D2560&security=tls&encryption=none&type=ws&sni=$PRX_DOMAIN&host=$PRX_DOMAIN&alpn=http%2F1.1&fp=chrome#PRX-Ultra"
 
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
