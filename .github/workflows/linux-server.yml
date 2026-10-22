@@ -337,7 +337,7 @@ jobs:
                   "connIdle": 600,
                   "uplinkOnly": 0,
                   "downlinkOnly": 0,
-                  "bufferSize": 10240
+                  "bufferSize": 512
                 }
               },
               "system": {
