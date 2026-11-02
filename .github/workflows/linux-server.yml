@@ -25,7 +25,7 @@ jobs:
           restore-keys: |
             kasm-profile-
 
-      - name: 1. Validate Secrets & Deep Kernel Network Tuning (BBR + FastOpen + Low-Latency TCP)
+      - name: 1. Validate Secrets & Deep Kernel Network Tuning (BBR + Low-Latency TCP)
         run: |
           # --- اعتبارسنجی سکرت‌ها ---
           if [ -z "$CF_TOKEN" ] || [ -z "$PRX_DOMAIN" ] || [ -z "$PRX_UUID" ] || [ -z "$PRX_USER_PASS" ]; then
@@ -44,8 +44,8 @@ jobs:
           net.core.default_qdisc = fq
           net.ipv4.tcp_congestion_control = bbr
 
-          # === TCP Fast Open در حالت امن برای جلوگیری از افت پکت در NAT گیت‌هاب ===
-          net.ipv4.tcp_fastopen = 1
+          # === غیرفعال‌سازی TCP Fast Open برای جلوگیری از دراپ پکت‌های TLS در NAT آژور/گیت‌هاب ===
+          net.ipv4.tcp_fastopen = 0
 
           # === حذف وقفه Slow Start پس از بی‌کاری سوکت ===
           net.ipv4.tcp_slow_start_after_idle = 0
@@ -53,7 +53,7 @@ jobs:
           # === کاهش فوق‌العاده Bufferbloat و لیتنسی ریموت دسکتاپ ===
           net.ipv4.tcp_notsent_lowat = 16384
 
-          # === بافرهای غول‌پیکر شبکه (۶۴ مگابایت) برای نرخ فریم و کیفیت تصویر ۶۰fps ===
+          # === بافرهای بهینه شبکه برای نرخ فریم ۶۰fps و پایداری استریم ===
           net.core.rmem_default = 2097152
           net.core.rmem_max = 67108864
           net.core.wmem_default = 2097152
@@ -81,10 +81,10 @@ jobs:
           net.ipv4.tcp_keepalive_intvl = 5
           net.ipv4.tcp_keepalive_probes = 6
 
-          # === امنیت و صف ورودی بالا (بدون تغییر پویای MTU برای جلوگیری از قطع استریم) ===
+          # === امنیت و فعال‌سازی MTU Probing برای جلوگیری از قفل شدن استریم‌های حجیم Gemini ===
           net.ipv4.tcp_syncookies = 1
           net.ipv4.tcp_max_syn_backlog = 65535
-          net.ipv4.tcp_mtu_probing = 0
+          net.ipv4.tcp_mtu_probing = 1
           net.ipv4.ip_local_port_range = 1024 65535
           net.ipv4.tcp_ecn = 0
 
@@ -97,7 +97,7 @@ jobs:
           SYSCTL
 
           sudo sysctl --system > /dev/null 2>&1
-          echo "✅ تنظیمات کرنل، BBR و کاهش لیتنسی اعمال شدند."
+          echo "✅ تنظیمات کرنل، BBR، MTU Probing و کاهش لیتنسی اعمال شدند."
 
       - name: 2. Setup Secure User, Dependencies & Deploy Extreme Webtop XFCE Desktop
         run: |
@@ -139,14 +139,14 @@ jobs:
           Name=Persian Keyboard Layout
           DESKTOP
 
-          # شورت‌کات اجرای مرورگر کروم روی دسکتاپ (همراه با --password-store=basic جهت حذف پاپ‌آپ Keyring)
+          # شورت‌کات اجرای مرورگر کروم روی دسکتاپ (همراه با --disable-quic جهت رفع مشکل سینک Gemini)
           cat <<'DESKTOP' > /home/runner/kasm_data/Desktop/google-chrome.desktop
           [Desktop Entry]
           Version=1.0
           Type=Application
           Name=Google Chrome
           Comment=Access the Internet
-          Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --password-store=basic --num-raster-threads=4 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader %U
+          Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --password-store=basic --disable-quic --num-raster-threads=4 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader %U
           Icon=google-chrome
           Path=/config
           Terminal=false
@@ -154,11 +154,11 @@ jobs:
           DESKTOP
           chmod +x /home/runner/kasm_data/Desktop/google-chrome.desktop
 
-          # اجرای خودکار مرورگر کروم هنگام بالا آمدن دسکتاپ با تنظیمات رندرینگ تقویت‌شده
+          # اجرای خودکار مرورگر کروم هنگام بالا آمدن دسکتاپ با غیرفعال‌سازی QUIC و تنظیمات رندرینگ
           cat <<'DESKTOP' > /home/runner/kasm_data/.config/autostart/chrome.desktop
           [Desktop Entry]
           Type=Application
-          Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --password-store=basic --num-raster-threads=4 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader
+          Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --password-store=basic --disable-quic --num-raster-threads=4 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader
           Hidden=false
           NoDisplay=false
           X-GNOME-Autostart-enabled=true
@@ -167,12 +167,14 @@ jobs:
 
           sudo chown -R 1000:1000 /home/runner/kasm_data
 
-          # اجرای کانتینر میزکار کامل لینوکس (Webtop XFCE) بر روی پورت ۳۰۰۰
+          # اجرای کانتینر میزکار کامل لینوکس (Webtop XFCE) بر روی پورت ۳۰۰۰ همراه با DNSهای سریع
           sudo docker run -d \
             --name=kasm-chrome \
             -p 127.0.0.1:3000:3000 \
             --shm-size=8g \
             --ipc=host \
+            --dns=1.1.1.1 \
+            --dns=8.8.8.8 \
             -v /home/runner/kasm_data:/config \
             -e PUID=1000 \
             -e PGID=1000 \
@@ -195,13 +197,13 @@ jobs:
             rm -f /tmp/chrome.deb
           " 2>/dev/null || true
 
-          # اعمال نقشه کیبورد و اجرای خودکار کروم پس از نصب در محیط دسکتاپ
+          # اعمال نقشه کیبورد و اجرای خودکار کروم (با QUIC غیرفعال) پس از نصب در محیط دسکتاپ
           sudo docker exec -u 1000 -e DISPLAY=:1 kasm-chrome bash -c "
             setxkbmap -layout 'us,ir' -option 'grp:alt_shift_toggle' 2>/dev/null || true
-            pgrep -f google-chrome >/dev/null || nohup /usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --password-store=basic --num-raster-threads=4 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader >/dev/null 2>&1 &
+            pgrep -f google-chrome >/dev/null || nohup /usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --password-store=basic --disable-quic --num-raster-threads=4 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader >/dev/null 2>&1 &
           " 2>/dev/null || true
 
-          echo "✅ میزکار XFCE همراه با Google Chrome و پشتیبانی کامل کیبورد فارسی مستقر شدند."
+          echo "✅ میزکار XFCE همراه با Google Chrome (بدون تداخل QUIC) و کیبورد فارسی مستقر شدند."
 
       - name: 3. Install & Configure Xray-Core (Fully Optimized VLESS WS)
         run: |
@@ -285,7 +287,7 @@ jobs:
                 "sniffing": {
                   "enabled": true,
                   "destOverride": ["http", "tls", "quic"],
-                  "routeOnly": true
+                  "routeOnly": false
                 }
               }
             ],
@@ -319,7 +321,7 @@ jobs:
                 {
                   "type": "field",
                   "outboundTag": "block",
-                  "protocol": ["bittorrent"]
+                  "protocol": ["bittorrent", "quic"]
                 },
                 {
                   "type": "field",
@@ -339,8 +341,8 @@ jobs:
                 "0": {
                   "handshake": 10,
                   "connIdle": 600,
-                  "uplinkOnly": 2,
-                  "downlinkOnly": 5,
+                  "uplinkOnly": 30,
+                  "downlinkOnly": 60,
                   "bufferSize": 512
                 }
               },
@@ -565,10 +567,10 @@ jobs:
           echo "║    ✅ Full XFCE Desktop + Native X11 Key Mapping        ║"
           echo "║    ✅ Dual Language Keyboard (English + Persian)         ║"
           echo "║    ✅ Toggle Shortcut: Alt + Shift                       ║"
-          echo "║    ✅ Google Chrome Official Stable (Keyring Bypassed)   ║"
+          echo "║    ✅ Google Chrome Official (QUIC Disabled for Gemini)  ║"
           echo "║    ✅ Persian Standard Fonts (Vazirmatn / FarsiWeb)     ║"
           echo "║    ✅ 8GB Shared RAM (shm) + Host IPC Mode              ║"
-          echo "║    ✅ BBR Congestion Control + QUIC Blocked for Gemini  ║"
+          echo "║    ✅ BBR + MTU Probing + QUIC Blocked in Xray          ║"
           echo "║    ✅ Guaranteed Auto-Save Cache Before 6h Cutoff        ║"
           echo "╠══════════════════════════════════════════════════════════╣"
           echo "║  🚀 VLESS Connection Link:                              ║"
