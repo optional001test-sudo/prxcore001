@@ -25,7 +25,7 @@ jobs:
           restore-keys: |
             kasm-profile-
 
-      - name: 1. Validate Secrets & Deep Kernel Network Tuning (BBR + Low-Latency TCP)
+      - name: 1. Validate Secrets & Deep Kernel Network Tuning (BBR + MSS Clamping + Low-Latency TCP)
         run: |
           # --- اعتبارسنجی سکرت‌ها ---
           if [ -z "$CF_TOKEN" ] || [ -z "$PRX_DOMAIN" ] || [ -z "$PRX_UUID" ] || [ -z "$PRX_USER_PASS" ]; then
@@ -76,10 +76,10 @@ jobs:
           net.ipv4.tcp_tw_reuse = 1
           net.ipv4.tcp_max_tw_buckets = 2000000
 
-          # === Keepalive بهینه (تست سلامت سریع کانکشن) ===
-          net.ipv4.tcp_keepalive_time = 45
+          # === Keepalive بهینه (تست سلامت سریع کانکشن در زمان تفکر طولانی هوش مصنوعی) ===
+          net.ipv4.tcp_keepalive_time = 20
           net.ipv4.tcp_keepalive_intvl = 5
-          net.ipv4.tcp_keepalive_probes = 6
+          net.ipv4.tcp_keepalive_probes = 9
 
           # === امنیت و فعال‌سازی MTU Probing برای جلوگیری از قفل شدن استریم‌های حجیم Gemini ===
           net.ipv4.tcp_syncookies = 1
@@ -97,7 +97,13 @@ jobs:
           SYSCTL
 
           sudo sysctl --system > /dev/null 2>&1
-          echo "✅ تنظیمات کرنل، BBR، MTU Probing و کاهش لیتنسی اعمال شدند."
+
+          # --- تنظیم خودکار سایز پکت‌ها (TCP MSS Clamping) جهت جلوگیری از دراپ شدن پاسخ‌های طولانی ---
+          sudo iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+          sudo iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+          sudo iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+
+          echo "✅ تنظیمات کرنل، BBR، MTU Probing و TCP MSS Clamping اعمال شدند."
 
       - name: 2. Setup Secure User, Dependencies & Deploy Extreme Webtop XFCE Desktop
         run: |
@@ -205,7 +211,7 @@ jobs:
 
           echo "✅ میزکار XFCE همراه با Google Chrome (بدون تداخل QUIC) و کیبورد فارسی مستقر شدند."
 
-      - name: 3. Install & Configure Xray-Core (Fully Optimized VLESS WS)
+      - name: 3. Install & Configure Xray-Core (Fully Optimized VLESS WS with Heartbeat)
         run: |
           export TERM=xterm-256color
           curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/install-xray.sh
@@ -278,10 +284,13 @@ jobs:
                 "streamSettings": {
                   "network": "ws",
                   "wsSettings": {
-                    "path": "/prx-stream"
+                    "path": "/prx-stream",
+                    "heartbeatPeriod": 20
                   },
                   "sockopt": {
-                    "tcpNoDelay": true
+                    "tcpNoDelay": true,
+                    "tcpKeepAliveInterval": 15,
+                    "tcpKeepAliveIdle": 30
                   }
                 },
                 "sniffing": {
@@ -301,7 +310,9 @@ jobs:
                 "streamSettings": {
                   "sockopt": {
                     "tcpNoDelay": true,
-                    "tcpCongestion": "bbr"
+                    "tcpCongestion": "bbr",
+                    "tcpKeepAliveInterval": 15,
+                    "tcpKeepAliveIdle": 30
                   }
                 }
               },
@@ -339,10 +350,10 @@ jobs:
             "policy": {
               "levels": {
                 "0": {
-                  "handshake": 10,
-                  "connIdle": 600,
-                  "uplinkOnly": 30,
-                  "downlinkOnly": 60,
+                  "handshake": 15,
+                  "connIdle": 3600,
+                  "uplinkOnly": 60,
+                  "downlinkOnly": 120,
                   "bufferSize": 512
                 }
               },
@@ -360,7 +371,7 @@ jobs:
           sleep 2
 
           if sudo systemctl is-active --quiet xray; then
-            echo "✅ Xray با موفقیت اجرا شد."
+            echo "✅ Xray با پینگ خودکار (Heartbeat) و تایم‌اوت ۱ ساعته اجرا شد."
           else
             echo "❌ خطا در اجرای Xray:"
             sudo journalctl -u xray --no-pager -n 20
@@ -393,7 +404,7 @@ jobs:
               types_hash_max_size 2048;
               server_tokens off;
 
-              keepalive_timeout 120;
+              keepalive_timeout 3600;
               keepalive_requests 100000;
 
               proxy_buffer_size 32k;
@@ -520,7 +531,7 @@ jobs:
             tmux new-session -A -s prxcore_workspace > /tmp/ttyd.log 2>&1 &
           sleep 2
 
-          # اجرای پایدار کلودفلرد با پروتکل http2
+          # اجرای پایدار کلودفلرد با پروتکل http2 و افزایش تایم‌اوت KeepAlive
           cat <<'LAUNCHER' | sudo tee /usr/local/bin/run_cloudflared.sh > /dev/null
           #!/bin/bash
           while true; do
@@ -529,7 +540,7 @@ jobs:
               --url http://127.0.0.1:8000 \
               --no-autoupdate \
               --edge-ip-version 4 \
-              --grace-period 10s \
+              --grace-period 30s \
               --retries 15 \
               run --token "$CF_TOKEN" >> /tmp/cf_tunnel.log 2>&1
             sleep 2
@@ -568,7 +579,7 @@ jobs:
           echo "║    ✅ Dual Language Keyboard (English + Persian)         ║"
           echo "║    ✅ Toggle Shortcut: Alt + Shift                       ║"
           echo "║    ✅ Google Chrome Official (QUIC Disabled for Gemini)  ║"
-          echo "║    ✅ Persian Standard Fonts (Vazirmatn / FarsiWeb)     ║"
+          echo "║    ✅ WS Heartbeat (20s) + 1h Idle Timeout + MSS Clamp  ║"
           echo "║    ✅ 8GB Shared RAM (shm) + Host IPC Mode              ║"
           echo "║    ✅ BBR + MTU Probing + QUIC Blocked in Xray          ║"
           echo "║    ✅ Guaranteed Auto-Save Cache Before 6h Cutoff        ║"
