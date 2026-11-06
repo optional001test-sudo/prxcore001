@@ -173,11 +173,11 @@ jobs:
 
           sudo chown -R 1000:1000 /home/runner/kasm_data
 
-          # اجرای کانتینر میزکار کامل لینوکس (Webtop XFCE) بر روی پورت ۳۰۰۰ همراه با DNSهای سریع
+          # اجرای کانتینر میزکار کامل لینوکس (Webtop XFCE) با shm-size ایمن (4g) برای جلوگیری از OOM
           sudo docker run -d \
             --name=kasm-chrome \
             -p 127.0.0.1:3000:3000 \
-            --shm-size=8g \
+            --shm-size=4g \
             --ipc=host \
             --dns=1.1.1.1 \
             --dns=8.8.8.8 \
@@ -192,9 +192,18 @@ jobs:
             --restart unless-stopped \
             lscr.io/linuxserver/webtop:ubuntu-xfce
 
+          # انتظار هوشمند تا بالا آمدن کامل سرور گرافیکی Xorg/Selkies در کانتینر
+          echo "⏳ انتظار برای بالا آمدن کامل X Server در کانتینر..."
+          for i in {1..30}; do
+            if sudo docker exec kasm-chrome pgrep -f "Xorg|Xvfb|selkies" >/dev/null 2>&1; then
+              echo "✅ سرور گرافیکی آماده است."
+              break
+            fi
+            sleep 1
+          done
+
           # نصب فونت‌های فارسی، ابزار کیبورد و مرورگر اصلی Google Chrome در کانتینر
           echo "⏳ در حال نصب فونت‌های فارسی و Google Chrome روی میزکار..."
-          sleep 6
           sudo docker exec -u 0 kasm-chrome bash -c "
             apt-get update -qq && \
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fonts-vazirmatn fonts-farsiweb x11-xkb-utils wget && \
@@ -211,7 +220,7 @@ jobs:
 
           echo "✅ میزکار XFCE همراه با Google Chrome (بدون تداخل QUIC) و کیبورد فارسی مستقر شدند."
 
-      - name: 3. Install & Configure Xray-Core (Fully Optimized VLESS WS with Heartbeat)
+      - name: 3. Install & Configure Xray-Core (Fully Optimized VLESS WS with Heartbeat & EarlyData)
         run: |
           export TERM=xterm-256color
           curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/install-xray.sh
@@ -285,7 +294,9 @@ jobs:
                   "network": "ws",
                   "wsSettings": {
                     "path": "/prx-stream",
-                    "heartbeatPeriod": 20
+                    "heartbeatPeriod": 20,
+                    "maxEarlyData": 2048,
+                    "earlyDataHeaderName": "Sec-WebSocket-Protocol"
                   },
                   "sockopt": {
                     "tcpNoDelay": true,
@@ -350,11 +361,11 @@ jobs:
             "policy": {
               "levels": {
                 "0": {
-                  "handshake": 15,
+                  "handshake": 10,
                   "connIdle": 3600,
-                  "uplinkOnly": 60,
-                  "downlinkOnly": 120,
-                  "bufferSize": 512
+                  "uplinkOnly": 5,
+                  "downlinkOnly": 10,
+                  "bufferSize": 64
                 }
               },
               "system": {
@@ -371,7 +382,7 @@ jobs:
           sleep 2
 
           if sudo systemctl is-active --quiet xray; then
-            echo "✅ Xray با پینگ خودکار (Heartbeat) و تایم‌اوت ۱ ساعته اجرا شد."
+            echo "✅ Xray با پینگ خودکار (Heartbeat)، پشتیبانی 0-RTT و بافر ضد Bufferbloat اجرا شد."
           else
             echo "❌ خطا در اجرای Xray:"
             sudo journalctl -u xray --no-pager -n 20
@@ -419,6 +430,11 @@ jobs:
           MAIN
 
           cat <<'SITE' | sudo tee /etc/nginx/sites-available/default
+          upstream xray_backend {
+              server 127.0.0.1:8080;
+              keepalive 512;
+          }
+
           upstream ttyd_backend {
               server 127.0.0.1:7681;
               keepalive 64;
@@ -436,15 +452,16 @@ jobs:
 
               # === ۱. مسیر پروکسی فیلترشکن VLESS WS ===
               location /prx-stream {
-                  if ($http_upgrade != "websocket") {
+                  if ($http_upgrade !~* "websocket") {
                       return 404;
                   }
                   access_log off;
                   proxy_redirect off;
-                  proxy_pass http://127.0.0.1:8080;
+                  proxy_pass http://xray_backend;
                   proxy_http_version 1.1;
                   proxy_set_header Upgrade $http_upgrade;
                   proxy_set_header Connection $connection_upgrade;
+                  proxy_set_header Sec-WebSocket-Protocol $http_sec_websocket_protocol;
                   proxy_set_header Host $host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -531,7 +548,7 @@ jobs:
             tmux new-session -A -s prxcore_workspace > /tmp/ttyd.log 2>&1 &
           sleep 2
 
-          # اجرای پایدار کلودفلرد با پروتکل http2 و افزایش تایم‌اوت KeepAlive
+          # اجرای پایدار کلودفلرد با پروتکل http2 و حفظ فلگ --url برای توکن‌های CLI
           cat <<'LAUNCHER' | sudo tee /usr/local/bin/run_cloudflared.sh > /dev/null
           #!/bin/bash
           while true; do
@@ -561,7 +578,8 @@ jobs:
 
       - name: 6. Generate Connection Info & Keep Alive (Safe Margin Before Timeout)
         run: |
-          VLESS_LINK="vless://$PRX_UUID@$PRX_DOMAIN:443?path=%2Fprx-stream&security=tls&encryption=none&type=ws&sni=$PRX_DOMAIN&host=$PRX_DOMAIN&alpn=http%2F1.1&fp=chrome#PRX-Ultra"
+          # لینک VLESS مجهز به Early Data (ed=2048) و بدون قفل محدودکننده ALPN
+          VLESS_LINK="vless://$PRX_UUID@$PRX_DOMAIN:443?path=%2Fprx-stream%3Fed%3D2048&security=tls&encryption=none&type=ws&sni=$PRX_DOMAIN&host=$PRX_DOMAIN&fp=chrome#PRX-Ultra"
 
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
@@ -579,10 +597,10 @@ jobs:
           echo "║    ✅ Dual Language Keyboard (English + Persian)         ║"
           echo "║    ✅ Toggle Shortcut: Alt + Shift                       ║"
           echo "║    ✅ Google Chrome Official (QUIC Disabled for Gemini)  ║"
-          echo "║    ✅ WS Heartbeat (20s) + 1h Idle Timeout + MSS Clamp  ║"
-          echo "║    ✅ 8GB Shared RAM (shm) + Host IPC Mode              ║"
+          echo "║    ✅ WS Heartbeat (20s) + 0-RTT EarlyData (ed=2048)     ║"
+          echo "║    ✅ 4GB Safe Shared RAM (shm) + Host IPC Mode          ║"
           echo "║    ✅ BBR + MTU Probing + QUIC Blocked in Xray          ║"
-          echo "║    ✅ Guaranteed Auto-Save Cache Before 6h Cutoff        ║"
+          echo "║    ✅ Instant Cache Save on Manual Cancel (Trap Signal)  ║"
           echo "╠══════════════════════════════════════════════════════════╣"
           echo "║  🚀 VLESS Connection Link:                              ║"
           echo "╚══════════════════════════════════════════════════════════╝"
@@ -592,9 +610,13 @@ jobs:
           echo "⏱️ سرور تا ۵ ساعت و ۴۵ دقیقه فعال می‌ماند و سپس ۱۵ دقیقه صرف ذخیره امن کوکی‌ها می‌شود..."
           echo "=================================================="
 
+          # شکار سیگنال Cancel گیت‌هاب برای خروج فوری و اجرای مرحله ذخیره کش کوکی‌ها
+          trap 'echo "⚠️ سیگنال توقف دریافت شد! خروج فوری برای ذخیره امن کوکی‌ها..."; exit 0' SIGINT SIGTERM
+
           # ۳۴۵ دقیقه (۵ ساعت و ۴۵ دقیقه) جهت تضمین اجرای کامل مراحل ۷ و ۸ قبل از سقف ۳۶۰ دقیقه‌ای گیت‌هاب
           for i in $(seq 1 345); do
-            sleep 60
+            sleep 60 &
+            wait $!
             if [ $((i % 10)) -eq 0 ]; then
               CF_UP=$(pgrep -c -f "cloudflared" 2>/dev/null || echo "0")
               XRAY_UP=$(pgrep -c -f "xray" 2>/dev/null || echo "0")
