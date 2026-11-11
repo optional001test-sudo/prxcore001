@@ -34,6 +34,12 @@ jobs:
           fi
           echo "✅ تمام سکرت‌ها تأیید شدند."
 
+          # --- تثبیت فوری DNS سیستم برای جلوگیری از قطع شدن رزولوشن دامنه پس از غیرفعال‌سازی IPv6 ---
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo systemctl disable systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 9.9.9.9\noptions timeout:2 attempts:3 rotate\n" | sudo tee /etc/resolv.conf > /dev/null
+
           # --- فعال‌سازی ماژول BBR در هسته لینوکس ---
           sudo modprobe tcp_bbr 2>/dev/null || true
           echo "tcp_bbr" | sudo tee -a /etc/modules-load.d/bbr.conf > /dev/null
@@ -98,12 +104,12 @@ jobs:
 
           sudo sysctl --system > /dev/null 2>&1
 
-          # --- تنظیم خودکار سایز پکت‌ها (TCP MSS Clamping) جهت جلوگیری از دراپ شدن پاسخ‌های طولانی ---
-          sudo iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+          # --- تنظیم خودکار سایز پکت‌ها (TCP MSS Clamping) با استثنا کردن اینترفیس داخلی lo ---
+          sudo iptables -t mangle -A POSTROUTING ! -o lo -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
           sudo iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-          sudo iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+          sudo iptables -t mangle -A OUTPUT ! -o lo -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 
-          echo "✅ تنظیمات کرنل، BBR، MTU Probing و TCP MSS Clamping اعمال شدند."
+          echo "✅ تنظیمات کرنل، DNS پایدار، BBR، MTU Probing و TCP MSS Clamping اعمال شدند."
 
       - name: 2. Setup Secure User, Dependencies & Deploy Extreme Webtop XFCE Desktop
         run: |
@@ -112,11 +118,24 @@ jobs:
           sudo usermod -aG sudo prxcore
           echo "prxcore ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/prxcore > /dev/null
 
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          # --- حذف میرور ناپایدار آژور (azure.archive.ubuntu.com) و جایگزینی با مخازن اصلی اوبونتو ---
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo tee /etc/apt/apt-mirrors.txt > /dev/null <<'MIRRORS'
+          http://archive.ubuntu.com/ubuntu/
+          http://us.archive.ubuntu.com/ubuntu/
+          http://mirrors.edge.kernel.org/ubuntu/
+          MIRRORS
+          fi
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
+          sudo sed -i 's|https://azure.archive.ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
+          sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
+
+          # --- نصب پکیج‌ها با اجبار به IPv4 و تلاش مجدد خودکار در صورت نوسان شبکه ---
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true -o Acquire::http::Timeout="15" update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y \
             htop tmux curl wget unzip nginx qrencode jq -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y fastfetch -qq 2>/dev/null || \
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y neofetch -qq 2>/dev/null || true
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::ForceIPv4=true install -y fastfetch -qq 2>/dev/null || \
+            sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::ForceIPv4=true install -y neofetch -qq 2>/dev/null || true
 
           # دانلود ttyd
           sudo wget -q -nc https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -O /usr/local/bin/ttyd
@@ -205,10 +224,10 @@ jobs:
           # نصب فونت‌های فارسی، ابزار کیبورد و مرورگر اصلی Google Chrome در کانتینر
           echo "⏳ در حال نصب فونت‌های فارسی و Google Chrome روی میزکار..."
           sudo docker exec -u 0 kasm-chrome bash -c "
-            apt-get update -qq && \
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fonts-vazirmatn fonts-farsiweb x11-xkb-utils wget && \
+            apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update -qq && \
+            DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y -qq fonts-vazirmatn fonts-farsiweb x11-xkb-utils wget && \
             wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb && \
-            apt-get install -y -qq /tmp/chrome.deb && \
+            apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y -qq /tmp/chrome.deb && \
             rm -f /tmp/chrome.deb
           " 2>/dev/null || true
 
