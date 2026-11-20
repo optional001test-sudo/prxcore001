@@ -555,8 +555,8 @@ jobs:
 
       - name: 5. Launch Services & Cloudflare Tunnel (Stable HTTP/2 Engine)
         run: |
-          # اجرای ttyd روی پورت 7681 با کاربر prxcore و پیشوند مسیر /terminal
-          sudo -u prxcore nohup /usr/local/bin/ttyd \
+          # اجرای ttyd روی پورت 7681 با کاربر prxcore و فلگ -H جهت جلوگیری از خطای دسترسی tmux
+          sudo -H -u prxcore nohup /usr/local/bin/ttyd \
             -c "prxcore:$PRX_USER_PASS" \
             -W \
             -p 7681 \
@@ -584,7 +584,7 @@ jobs:
           LAUNCHER
           sudo chmod +x /usr/local/bin/run_cloudflared.sh
 
-          # پاکسازی فاصله یا خط جدید احتمالی در توکن و اجرا بدون sudo تا متغیر محیطی حفظ شود
+          # پاکسازی کاراکترهای اضافه احتمالی در توکن و اجرا بدون sudo جهت حفظ متغیر محیطی
           CLEAN_CF_TOKEN=$(printf '%s' "$CF_TOKEN" | tr -d '\r\n ')
           TUNNEL_TOKEN="$CLEAN_CF_TOKEN" nohup /usr/local/bin/run_cloudflared.sh > /dev/null 2>&1 &
           sleep 8
