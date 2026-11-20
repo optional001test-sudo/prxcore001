@@ -555,8 +555,8 @@ jobs:
 
       - name: 5. Launch Services & Cloudflare Tunnel (Stable HTTP/2 Engine)
         run: |
-          # اجرای ttyd روی پورت 7681 با کاربر prxcore و فلگ -H جهت جلوگیری از خطای دسترسی tmux
-          sudo -H -u prxcore nohup /usr/local/bin/ttyd \
+          # اجرای ttyd روی پورت 7681 با کاربر prxcore و اصلاح کامل متغیرهای محیطی
+          sudo -H -u prxcore env HOME=/home/prxcore XDG_CONFIG_HOME=/home/prxcore/.config nohup /usr/local/bin/ttyd \
             -c "prxcore:$PRX_USER_PASS" \
             -W \
             -p 7681 \
@@ -564,7 +564,7 @@ jobs:
             -t fontSize=16 \
             -t 'theme={"background": "#0f172a"}' \
             -t rendererType=webgl \
-            tmux new-session -A -s prxcore_workspace > /tmp/ttyd.log 2>&1 &
+            tmux -f /dev/null new-session -A -s prxcore_workspace > /tmp/ttyd.log 2>&1 &
           sleep 2
 
           # اجرای پایدار کلودفلرد با پروتکل http2 و حفظ فلگ --url برای توکن‌های CLI
