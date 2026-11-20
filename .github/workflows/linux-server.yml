@@ -2,6 +2,24 @@ name: prxcore Beast Workstation & Ultra Low-Latency Remote Browser (Webtop XFCE 
 
 on:
   workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'مدت زمان فعالیت سرور به دقیقه (حداکثر 340 دقیقه برای حفظ حاشیه امن ذخیره کش)'
+        required: false
+        default: '340'
+        type: string
+      clean_profile:
+        description: 'شروع با پروفایل کاملاً تازه (بدون بازیابی کش قبلی)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prxcore-workstation-${{ github.workflow }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -18,6 +36,7 @@ jobs:
     steps:
       # === ۰. بازیابی سشن‌ها، کوکی‌ها و افزونه‌های ذخیره‌شده از اجراهای قبلی ===
       - name: 0. Restore Persistent Browser Profile & Cookies
+        if: ${{ !inputs.clean_profile }}
         uses: actions/cache/restore@v4
         with:
           path: /home/runner/kasm_data
@@ -25,52 +44,81 @@ jobs:
           restore-keys: |
             kasm-profile-
 
+      # === ۱. اعتبارسنجی سکرت‌ها، ثبت زمان شروع جاب و بهینه‌سازی دقیق کرنل ===
       - name: 1. Validate Secrets & Deep Kernel Network Tuning (BBR + MSS Clamping + Low-Latency TCP)
         run: |
-          # --- اعتبارسنجی سکرت‌ها ---
+          # ثبت زمان دقیق شروع جاب برای محاسبه هوشمند حاشیه امن پیش از سقف ۳۶۰ دقیقه‌ای
+          echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+
+          # --- اعتبارسنجی و پاکسازی سکرت‌ها ---
           if [ -z "$CF_TOKEN" ] || [ -z "$PRX_DOMAIN" ] || [ -z "$PRX_UUID" ] || [ -z "$PRX_USER_PASS" ]; then
             echo "❌ خطا: لطفاً مطمئن شوید تمام سکرت‌ها (CF_TUNNEL_TOKEN, PRX_DOMAIN, PRX_UUID, PRX_USER_PASS) در تنظیمات گیت‌هاب تعریف شده‌اند."
             exit 1
           fi
-          echo "✅ تمام سکرت‌ها تأیید شدند."
 
-          # --- تثبیت فوری DNS سیستم برای جلوگیری از قطع شدن رزولوشن دامنه پس از غیرفعال‌سازی IPv6 ---
+          CLEAN_DOMAIN=$(printf '%s' "$PRX_DOMAIN" | tr -d '\r\n ' | sed -E 's|^https?://||; s|/.*$||')
+          CLEAN_UUID=$(printf '%s' "$PRX_UUID" | tr -d '\r\n ')
+
+          if ! [[ "$CLEAN_UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            echo "❌ خطا: فرمت PRX_UUID معتبر نیست (باید UUID استاندارد باشد)."
+            exit 1
+          fi
+
+          if [ -z "$CLEAN_DOMAIN" ]; then
+            echo "❌ خطا: مقدار PRX_DOMAIN معتبر نیست."
+            exit 1
+          fi
+
+          echo "PRX_DOMAIN=$CLEAN_DOMAIN" >> "$GITHUB_ENV"
+          echo "PRX_UUID=$CLEAN_UUID" >> "$GITHUB_ENV"
+
+          # اعتبارسنجی و محدودسازی مدت زمان اجرا (حداکثر ۳۴۲ دقیقه از شروع کل جاب)
+          REQ_MINS="${{ inputs.duration_minutes || '340' }}"
+          if ! [[ "$REQ_MINS" =~ ^[0-9]+$ ]] || [ "$REQ_MINS" -lt 5 ]; then
+            REQ_MINS=340
+          elif [ "$REQ_MINS" -gt 342 ]; then
+            REQ_MINS=342
+          fi
+          echo "TARGET_TOTAL_MINUTES=$REQ_MINS" >> "$GITHUB_ENV"
+          echo "✅ تمام سکرت‌ها تأیید شدند (دامنه: $CLEAN_DOMAIN | سقف کل جاب: ${REQ_MINS} دقیقه)."
+
+          # --- تثبیت فوری DNS سیستم (اولویت اول 1.1.1.1 بدون rotate برای کمترین لتنسی) ---
           sudo systemctl stop systemd-resolved 2>/dev/null || true
           sudo systemctl disable systemd-resolved 2>/dev/null || true
           sudo rm -f /etc/resolv.conf
-          printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 9.9.9.9\noptions timeout:2 attempts:3 rotate\n" | sudo tee /etc/resolv.conf > /dev/null
+          printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 9.9.9.9\noptions edns0 timeout:2 attempts:3 single-request-reopen\n" | sudo tee /etc/resolv.conf > /dev/null
 
           # --- فعال‌سازی ماژول BBR در هسته لینوکس ---
           sudo modprobe tcp_bbr 2>/dev/null || true
-          echo "tcp_bbr" | sudo tee -a /etc/modules-load.d/bbr.conf > /dev/null
+          echo "tcp_bbr" | sudo tee /etc/modules-load.d/bbr.conf > /dev/null
 
-          # --- بهینه‌سازی کرنل برای کاهش لیتنسی و پایداری استریم روی شبکه گیت‌هاب ---
+          # --- بهینه‌سازی دقیق کرنل (تنظیم بافرهای متعادل ضد Bufferbloat و پایداری BBR) ---
           sudo tee /etc/sysctl.d/99-prxcore-optimize.conf > /dev/null <<'SYSCTL'
           # === BBR Congestion Control ===
           net.core.default_qdisc = fq
           net.ipv4.tcp_congestion_control = bbr
 
-          # === غیرفعال‌سازی TCP Fast Open برای جلوگیری از دراپ پکت‌های TLS در NAT آژور/گیت‌هاب ===
+          # === غیرفعال‌سازی TCP Fast Open برای جلوگیری از دراپ پکت‌های TLS در NAT آژور ===
           net.ipv4.tcp_fastopen = 0
 
           # === حذف وقفه Slow Start پس از بی‌کاری سوکت ===
           net.ipv4.tcp_slow_start_after_idle = 0
 
-          # === کاهش فوق‌العاده Bufferbloat و لیتنسی ریموت دسکتاپ ===
+          # === کاهش فوق‌العاده Bufferbloat و لتنسی استریم ریموت دسکتاپ ===
           net.ipv4.tcp_notsent_lowat = 16384
 
-          # === بافرهای بهینه شبکه برای نرخ فریم ۶۰fps و پایداری استریم ===
-          net.core.rmem_default = 2097152
-          net.core.rmem_max = 67108864
-          net.core.wmem_default = 2097152
-          net.core.wmem_max = 67108864
-          net.ipv4.tcp_rmem = 4096 2097152 67108864
-          net.ipv4.tcp_wmem = 4096 2097152 67108864
+          # === بافرهای متعادل شبکه (ضد Bufferbloat و ایمن از نظر مصرف رم) ===
+          net.core.rmem_default = 262144
+          net.core.rmem_max = 16777216
+          net.core.wmem_default = 262144
+          net.core.wmem_max = 16777216
+          net.ipv4.tcp_rmem = 4096 262144 16777216
+          net.ipv4.tcp_wmem = 4096 131072 16777216
           net.core.somaxconn = 65535
-          net.core.netdev_max_backlog = 250000
+          net.core.netdev_max_backlog = 100000
           net.core.optmem_max = 65536
 
-          # === تنظیمات Window Scaling و ریکاوری بلادرنگ پکت‌ها ===
+          # === تنظیمات Window Scaling و ریکاوری سریع پکت‌ها ===
           net.ipv4.tcp_window_scaling = 1
           net.ipv4.tcp_adv_win_scale = 1
           net.ipv4.tcp_sack = 1
@@ -82,19 +130,19 @@ jobs:
           net.ipv4.tcp_tw_reuse = 1
           net.ipv4.tcp_max_tw_buckets = 2000000
 
-          # === Keepalive بهینه (تست سلامت سریع کانکشن در زمان تفکر طولانی هوش مصنوعی) ===
-          net.ipv4.tcp_keepalive_time = 20
-          net.ipv4.tcp_keepalive_intvl = 5
-          net.ipv4.tcp_keepalive_probes = 9
+          # === Keepalive متعادل (مقاوم در برابر نوسان لحظه‌ای شبکه و مناسب تفکر طولانی AI) ===
+          net.ipv4.tcp_keepalive_time = 30
+          net.ipv4.tcp_keepalive_intvl = 10
+          net.ipv4.tcp_keepalive_probes = 6
 
-          # === امنیت و فعال‌سازی MTU Probing برای جلوگیری از قفل شدن استریم‌های حجیم Gemini ===
+          # === امنیت و فعال‌سازی MTU Probing ===
           net.ipv4.tcp_syncookies = 1
           net.ipv4.tcp_max_syn_backlog = 65535
           net.ipv4.tcp_mtu_probing = 1
           net.ipv4.ip_local_port_range = 1024 65535
           net.ipv4.tcp_ecn = 0
 
-          # === ARP و غیرفعال‌سازی IPv6 برای مسیردهی مستقیم ===
+          # === ARP و غیرفعال‌سازی IPv6 روی اینترفیس‌های خارجی ===
           net.ipv4.neigh.default.gc_thresh1 = 1024
           net.ipv4.neigh.default.gc_thresh2 = 4096
           net.ipv4.neigh.default.gc_thresh3 = 8192
@@ -102,15 +150,15 @@ jobs:
           net.ipv6.conf.default.disable_ipv6 = 1
           SYSCTL
 
-          sudo sysctl --system > /dev/null 2>&1
+          sudo sysctl -p /etc/sysctl.d/99-prxcore-optimize.conf > /dev/null 2>&1 || sudo sysctl --system > /dev/null 2>&1
 
-          # --- تنظیم خودکار سایز پکت‌ها (TCP MSS Clamping) با استثنا کردن اینترفیس داخلی lo ---
+          # --- تنظیم یکپارچه TCP MSS Clamping (POSTROUTING هر دو ترافیک هاست و داکر را پوشش می‌دهد) ---
           sudo iptables -t mangle -A POSTROUTING ! -o lo -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-          sudo iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-          sudo iptables -t mangle -A OUTPUT ! -o lo -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 
-          echo "✅ تنظیمات کرنل، DNS پایدار، BBR، MTU Probing و TCP MSS Clamping اعمال شدند."
+          ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+          echo "✅ تنظیمات کرنل اعمال شدند (Congestion Control فعال: $ACTIVE_CC)."
 
+      # === ۲. ساخت کاربر، نصب ابزارها و استقرار میزکار Webtop XFCE + Chrome ===
       - name: 2. Setup Secure User, Dependencies & Deploy Extreme Webtop XFCE Desktop
         id: setup_desktop
         run: |
@@ -122,46 +170,38 @@ jobs:
           sudo mkdir -p /home/prxcore/.config/tmux
           sudo chown -R prxcore:prxcore /home/prxcore
 
-          # --- حذف میرور ناپایدار آژور (azure.archive.ubuntu.com) و جایگزینی با مخازن اصلی اوبونتو ---
-          if [ -f /etc/apt/apt-mirrors.txt ]; then
-            sudo tee /etc/apt/apt-mirrors.txt > /dev/null <<'MIRRORS'
-          http://archive.ubuntu.com/ubuntu/
-          http://us.archive.ubuntu.com/ubuntu/
-          http://mirrors.edge.kernel.org/ubuntu/
-          MIRRORS
-          fi
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
-          sudo sed -i 's|https://azure.archive.ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
-          sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
+          # --- جایگزینی میرور ناپایدار آژور با مخازن اصلی اوبونتو ---
+          sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
+          sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors\.txt|http://archive.ubuntu.com/ubuntu/|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
 
-          # --- نصب پکیج‌ها با اجبار به IPv4 و تلاش مجدد خودکار در صورت نوسان شبکه ---
+          # --- نصب پکیج‌های ضروری با اجبار به IPv4 ---
           sudo apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true -o Acquire::http::Timeout="15" update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y \
-            htop tmux curl wget unzip nginx qrencode jq -qq
+            htop tmux curl wget unzip nginx jq openssl -qq
 
-          # نصب fastfetch (از مخزن یا نسخه رسمی گیت‌هاب در صورت نبودن در ریپوی اوبونتو)
+          # نصب fastfetch (از مخزن یا نسخه رسمی گیت‌هاب)
           if ! sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::ForceIPv4=true install -y fastfetch -qq 2>/dev/null; then
             curl -fsSL --retry 3 https://github.com/fastfetch-cli/fastfetch/releases/latest/download/fastfetch-linux-amd64.deb -o /tmp/fastfetch.deb 2>/dev/null && \
               sudo dpkg -i /tmp/fastfetch.deb >/dev/null 2>&1 || true
             rm -f /tmp/fastfetch.deb
           fi
 
-          # دانلود پایدار ttyd و cloudflared با قابلیت Retry و اعتبارسنجی
+          # دانلود پایدار ttyd و cloudflared
           sudo curl -fsSL --retry 5 --retry-delay 2 https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -o /usr/local/bin/ttyd
           sudo chmod +x /usr/local/bin/ttyd
 
           sudo curl -fsSL --retry 5 --retry-delay 2 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
           sudo chmod +x /usr/local/bin/cloudflared
 
-          # آماده‌سازی دایرکتوری پایدار پروفایل و پوشه‌های کانفیگ XFCE
+          # آماده‌سازی دایرکتوری پایدار پروفایل و حذف فایل‌های قفل قدیمی
           mkdir -p /home/runner/kasm_data/.config/autostart
           mkdir -p /home/runner/kasm_data/Desktop
-
-          # حذف فایل‌های قفل موقت پیشین
           sudo rm -f /home/runner/kasm_data/Singleton* \
-                      /home/runner/kasm_data/.config/google-chrome/Singleton* 2>/dev/null || true
+                     /home/runner/kasm_data/.config/google-chrome/Singleton* 2>/dev/null || true
 
-          # تنظیم سوییچ دائمی کیبورد فارسی و انگلیسی با Alt+Shift در استارتاپ میزکار
+          # تنظیم سوییچ دائمی کیبورد فارسی و انگلیسی با Alt+Shift
           cat <<'DESKTOP' > /home/runner/kasm_data/.config/autostart/keyboard.desktop
           [Desktop Entry]
           Type=Application
@@ -172,14 +212,17 @@ jobs:
           Name=Persian Keyboard Layout
           DESKTOP
 
-          # شورت‌کات اجرای مرورگر کروم روی دسکتاپ (همراه با --disable-quic جهت رفع مشکل سینک Gemini)
-          cat <<'DESKTOP' > /home/runner/kasm_data/Desktop/google-chrome.desktop
+          # فلگ‌های بهینه کروم (بهره‌گیری واقعی از 4GB /dev/shm + 2 ترد رستر برای روان ماندن Selkies)
+          CHROME_FLAGS="--no-sandbox --password-store=basic --disable-quic --num-raster-threads=2 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader --no-first-run --no-default-browser-check"
+
+          # شورت‌کات اجرای مرورگر کروم روی دسکتاپ
+          cat <<DESKTOP > /home/runner/kasm_data/Desktop/google-chrome.desktop
           [Desktop Entry]
           Version=1.0
           Type=Application
           Name=Google Chrome
           Comment=Access the Internet
-          Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --password-store=basic --disable-quic --num-raster-threads=4 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader %U
+          Exec=/usr/bin/google-chrome-stable $CHROME_FLAGS %U
           Icon=google-chrome
           Path=/config
           Terminal=false
@@ -187,11 +230,11 @@ jobs:
           DESKTOP
           chmod +x /home/runner/kasm_data/Desktop/google-chrome.desktop
 
-          # اجرای خودکار مرورگر کروم هنگام بالا آمدن دسکتاپ با غیرفعال‌سازی QUIC و تنظیمات رندرینگ
-          cat <<'DESKTOP' > /home/runner/kasm_data/.config/autostart/chrome.desktop
+          # فایل Autostart برای اجراهای ری‌استارت احتمالی کانتینر
+          cat <<DESKTOP > /home/runner/kasm_data/.config/autostart/chrome.desktop
           [Desktop Entry]
           Type=Application
-          Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --password-store=basic --disable-quic --num-raster-threads=4 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader
+          Exec=/usr/bin/google-chrome-stable $CHROME_FLAGS
           Hidden=false
           NoDisplay=false
           X-GNOME-Autostart-enabled=true
@@ -200,12 +243,21 @@ jobs:
 
           sudo chown -R 1000:1000 /home/runner/kasm_data
 
-          # اجرای کانتینر میزکار کامل لینوکس (Webtop XFCE) با shm-size ایمن (4g) برای جلوگیری از OOM
+          # دانلود ایمیج Webtop با تلاش مجدد خودکار جهت مقابله با نوسان رجیستری
+          for attempt in 1 2 3; do
+            if sudo docker pull lscr.io/linuxserver/webtop:ubuntu-xfce; then
+              break
+            fi
+            echo "⚠️ تلاش $attempt برای دریافت ایمیج Webtop ناموفق بود؛ تلاش مجدد..."
+            sleep 3
+          done
+
+          # اجرای کانتینر میزکار Webtop XFCE (حذف --ipc=host تا --shm-size=4g واقعاً فعال و ایزوله باشد)
           sudo docker run -d \
             --name=kasm-chrome \
+            --hostname=prxcore-desktop \
             -p 127.0.0.1:3000:3000 \
             --shm-size=4g \
-            --ipc=host \
             --dns=1.1.1.1 \
             --dns=8.8.8.8 \
             -v /home/runner/kasm_data:/config \
@@ -213,23 +265,30 @@ jobs:
             -e PGID=1000 \
             -e TZ=Etc/UTC \
             -e LC_ALL=en_US.UTF-8 \
+            -e TITLE="prxcore Workstation" \
             -e CUSTOM_USER=prxcore \
             -e PASSWORD="$PRX_USER_PASS" \
-            -e KEYBOARD="us,ir" \
             --restart unless-stopped \
             lscr.io/linuxserver/webtop:ubuntu-xfce
 
-          # انتظار هوشمند تا بالا آمدن کامل سرور گرافیکی Xorg/Selkies در کانتینر
-          echo "⏳ انتظار برای بالا آمدن کامل X Server در کانتینر..."
-          for i in {1..30}; do
-            if sudo docker exec kasm-chrome pgrep -f "Xorg|Xvfb|selkies" >/dev/null 2>&1; then
-              echo "✅ سرور گرافیکی آماده است."
+          # انتظار هوشمند تا آماده شدن واقعی سرور گرافیکی و سرویس وب پورت 3000
+          echo "⏳ انتظار برای بالا آمدن کامل X Server و سرویس وب دسکتاپ..."
+          WEBTOP_READY=0
+          for i in {1..45}; do
+            HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000 2>/dev/null || echo "000")
+            if sudo docker exec kasm-chrome pgrep -f "Xorg|Xvfb|selkies" >/dev/null 2>&1 && \
+               [[ "$HTTP_CODE" =~ ^(200|301|302|401)$ ]]; then
+              echo "✅ سرور گرافیکی و پورت 3000 آماده هستند (HTTP $HTTP_CODE)."
+              WEBTOP_READY=1
               break
             fi
             sleep 1
           done
+          if [ "$WEBTOP_READY" -ne 1 ]; then
+            echo "⚠️ هشدار: پاسخ‌دهی اولیه پورت 3000 با تأخیر مواجه شد؛ ادامه مراحل نصب..."
+          fi
 
-          # نصب مستقل فونت‌های فارسی، ابزار کیبورد و مرورگر Google Chrome بدون شکست خاموش
+          # نصب فونت‌های فارسی، ابزار کیبورد و مرورگر Google Chrome همراه با پاکسازی کش apt کانتینر
           echo "⏳ در حال نصب فونت‌های فارسی و Google Chrome روی میزکار..."
           sudo docker exec -u 0 kasm-chrome bash -c '
             set -e
@@ -241,30 +300,38 @@ jobs:
             DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y -qq /tmp/chrome.deb || \
               DEBIAN_FRONTEND=noninteractive apt-get -f install -y -qq
             rm -f /tmp/chrome.deb
+            apt-get clean
+            rm -rf /var/lib/apt/lists/*
           '
 
-          # اعمال نقشه کیبورد و اجرای خودکار کروم (با QUIC غیرفعال) با HOME صحیح در کانتینر
-          sudo docker exec -u 1000 -e DISPLAY=:1 -e HOME=/config kasm-chrome bash -c "
-            setxkbmap -layout 'us,ir' -option 'grp:alt_shift_toggle' 2>/dev/null || true
-            pgrep -f google-chrome >/dev/null || nohup /usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --password-store=basic --disable-quic --num-raster-threads=4 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader >/dev/null 2>&1 &
-          " 2>/dev/null || true
+          # تشخیص خودکار DISPLAY، اعمال کیبورد فارسی و اجرای قطعی کروم (رفع باگ خودتطبیقی pgrep)
+          sudo docker exec -u 1000 -e HOME=/config -e CHROME_FLAGS="$CHROME_FLAGS" kasm-chrome bash -c '
+            DISP=$(ls /tmp/.X11-unix 2>/dev/null | sed "s/^X/:/" | head -n 1)
+            export DISPLAY="${DISP:-:1}"
+            setxkbmap -layout "us,ir" -option "grp:alt_shift_toggle" 2>/dev/null || true
+            if ! pgrep -f "/opt/google/chrome/chrome" >/dev/null 2>&1; then
+              nohup /usr/bin/google-chrome-stable $CHROME_FLAGS </dev/null >/dev/null 2>&1 &
+            fi
+          ' 2>/dev/null || true
 
-          echo "✅ میزکار XFCE همراه با Google Chrome (بدون تداخل QUIC) و کیبورد فارسی مستقر شدند."
+          echo "✅ میزکار XFCE همراه با Google Chrome (با /dev/shm واقعی ۴ گیگابایتی) و کیبورد فارسی مستقر شدند."
 
-      - name: 3. Install & Configure Xray-Core (Fully Optimized VLESS WS with Heartbeat & EarlyData)
+      # === ۳. نصب و پیکربندی بهینه Xray-Core (VLESS WS + Heartbeat + ضد SSRF) ===
+      - name: 3. Install & Configure Xray-Core (Optimized VLESS WS with Heartbeat & High-Throughput Buffer)
         run: |
           export TERM=xterm-256color
           curl -fsSL --retry 5 https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/install-xray.sh
           sed -i 's/tput setaf [0-9]/true/g; s/tput sgr0/true/g' /tmp/install-xray.sh
 
           if ! sudo env TERM=xterm-256color bash /tmp/install-xray.sh install; then
-            echo "⚠️ اسکریپت نصب با محدودیت مواجه شد؛ در حال نصب مستقیم هسته Xray..."
+            echo "⚠️ اسکریپت رسمی با محدودیت مواجه شد؛ در حال نصب تمیز مستقیم هسته Xray..."
             sudo mkdir -p /usr/local/bin /usr/local/share/xray /usr/local/etc/xray
+            rm -rf /tmp/xray_extract && mkdir -p /tmp/xray_extract
             curl -fsSL --retry 5 https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o /tmp/xray.zip
-            sudo unzip -qo /tmp/xray.zip -d /usr/local/bin/
-            sudo chmod +x /usr/local/bin/xray
-            sudo mv -f /usr/local/bin/*.dat /usr/local/share/xray/ 2>/dev/null || true
-            rm -f /tmp/xray.zip
+            unzip -qo /tmp/xray.zip -d /tmp/xray_extract
+            sudo install -m 755 /tmp/xray_extract/xray /usr/local/bin/xray
+            sudo mv -f /tmp/xray_extract/*.dat /usr/local/share/xray/ 2>/dev/null || true
+            rm -rf /tmp/xray.zip /tmp/xray_extract
 
             cat <<'SERVICE' | sudo tee /etc/systemd/system/xray.service > /dev/null
           [Unit]
@@ -278,16 +345,25 @@ jobs:
           AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
           NoNewPrivileges=true
           ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
-          Restart=on-failure
-          RestartPreventExitStatus=23
+          Restart=always
+          RestartSec=2
           LimitNPROC=10000
-          LimitNOFILE=1000000
+          LimitNOFILE=1048576
 
           [Install]
           WantedBy=multi-user.target
           SERVICE
-            sudo systemctl daemon-reload
           fi
+          rm -f /tmp/install-xray.sh
+
+          # تضمین Restart خودکار و سقف File Descriptor بالا در هر دو حالت نصب
+          sudo mkdir -p /etc/systemd/system/xray.service.d
+          cat <<'OVERRIDE' | sudo tee /etc/systemd/system/xray.service.d/override.conf > /dev/null
+          [Service]
+          Restart=always
+          RestartSec=2
+          LimitNOFILE=1048576
+          OVERRIDE
 
           sudo mkdir -p /usr/local/etc/xray
           cat <<EOF | sudo tee /usr/local/etc/xray/config.json > /dev/null
@@ -372,6 +448,20 @@ jobs:
                 {
                   "type": "field",
                   "outboundTag": "block",
+                  "ip": [
+                    "127.0.0.0/8",
+                    "10.0.0.0/8",
+                    "172.16.0.0/12",
+                    "192.168.0.0/16",
+                    "169.254.0.0/16",
+                    "::1/128",
+                    "fc00::/7",
+                    "fe80::/10"
+                  ]
+                },
+                {
+                  "type": "field",
+                  "outboundTag": "block",
                   "protocol": ["bittorrent", "quic"]
                 },
                 {
@@ -394,7 +484,7 @@ jobs:
                   "connIdle": 3600,
                   "uplinkOnly": 5,
                   "downlinkOnly": 10,
-                  "bufferSize": 64
+                  "bufferSize": 512
                 }
               },
               "system": {
@@ -405,7 +495,7 @@ jobs:
           }
           EOF
 
-          # تست اعتبارسنجی کانفیگ Xray پیش از اجرا
+          # تست اعتبارسنجی کانفیگ پیش از اجرا
           sudo /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json
 
           sudo systemctl daemon-reload
@@ -414,15 +504,22 @@ jobs:
           sleep 2
 
           if sudo systemctl is-active --quiet xray; then
-            echo "✅ Xray با پینگ خودکار (Heartbeat)، پشتیبانی 0-RTT و بافر ضد Bufferbloat اجرا شد."
+            echo "✅ Xray با بافر 512KB (سرعت کامل بدون Bufferbloat)، Heartbeat و محافظت SSRF اجرا شد."
           else
             echo "❌ خطا در اجرای Xray:"
             sudo journalctl -u xray --no-pager -n 25
             exit 1
           fi
 
-      - name: 4. Configure Nginx Ultra Multiplexer (No-Lag WebSocket & True Upstream Keepalive)
+      # === ۴. پیکربندی Nginx (محدود به Localhost، حفظ HTTPS، احراز هویت امن ترمینال) ===
+      - name: 4. Configure Nginx Ultra Multiplexer (Localhost-Only, True Keepalive & Secure Auth)
         run: |
+          # ساخت فایل هش‌شده SHA-512 برای احراز هویت وب‌ترمینال (جلوگیری از نمایش پسورد در ps aux)
+          HASHED_PASS=$(openssl passwd -6 "$PRX_USER_PASS")
+          printf 'prxcore:%s\n' "$HASHED_PASS" | sudo tee /etc/nginx/.htpasswd > /dev/null
+          sudo chown root:www-data /etc/nginx/.htpasswd
+          sudo chmod 640 /etc/nginx/.htpasswd
+
           cat <<'MAIN' | sudo tee /etc/nginx/nginx.conf > /dev/null
           user www-data;
           worker_processes auto;
@@ -440,6 +537,15 @@ jobs:
                   default upgrade;
                   '' "";
               }
+
+              # حفظ پروتکل واقعی HTTPS ارسال‌شده از کلودفلر
+              map $http_x_forwarded_proto $forwarded_proto {
+                  default $http_x_forwarded_proto;
+                  '' $scheme;
+              }
+
+              access_log off;
+              error_log /var/log/nginx/error.log warn;
 
               sendfile on;
               tcp_nopush on;
@@ -465,29 +571,34 @@ jobs:
           upstream xray_backend {
               server 127.0.0.1:8080;
               keepalive 512;
+              keepalive_timeout 3600s;
+              keepalive_requests 100000;
           }
 
           upstream ttyd_backend {
               server 127.0.0.1:7681;
               keepalive 64;
+              keepalive_timeout 3600s;
+              keepalive_requests 100000;
           }
 
           upstream kasm_backend {
               server 127.0.0.1:3000;
               keepalive 256;
+              keepalive_timeout 3600s;
+              keepalive_requests 100000;
           }
 
           server {
-              listen 8000 default_server reuseport;
+              listen 127.0.0.1:8000 default_server reuseport;
               server_name _;
               client_max_body_size 0;
 
-              # === ۱. مسیر پروکسی فیلترشکن VLESS WS ===
-              location /prx-stream {
+              # === ۱. مسیر پروکسی فیلترشکن VLESS WS (تطبیق دقیق مسیر با پشتیبانی Query String مثل ed=2048) ===
+              location = /prx-stream {
                   if ($http_upgrade !~* "websocket") {
                       return 404;
                   }
-                  access_log off;
                   proxy_redirect off;
                   proxy_pass http://xray_backend;
                   proxy_http_version 1.1;
@@ -497,7 +608,7 @@ jobs:
                   proxy_set_header Host $host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_set_header X-Forwarded-Proto $forwarded_proto;
 
                   proxy_buffering off;
                   proxy_request_buffering off;
@@ -509,12 +620,15 @@ jobs:
                   proxy_socket_keepalive on;
               }
 
-              # === ۲. مسیر وب‌ترمینال لینوکس (ttyd) ===
+              # === ۲. مسیر وب‌ترمینال لینوکس (ttyd با احراز هویت امن Nginx) ===
               location = /terminal {
                   return 301 /terminal/;
               }
 
               location ^~ /terminal/ {
+                  auth_basic "prxcore Terminal";
+                  auth_basic_user_file /etc/nginx/.htpasswd;
+
                   proxy_pass http://ttyd_backend;
                   proxy_http_version 1.1;
                   proxy_set_header Upgrade $http_upgrade;
@@ -522,15 +636,18 @@ jobs:
                   proxy_set_header Host $host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $forwarded_proto;
 
                   proxy_buffering off;
-                  proxy_connect_timeout 2s;
+                  proxy_request_buffering off;
+                  proxy_cache off;
+                  proxy_connect_timeout 5s;
                   proxy_read_timeout 86400s;
                   proxy_send_timeout 86400s;
                   proxy_socket_keepalive on;
               }
 
-              # === ۳. مسیر اصلی: ریموت دسکتاپ بروزر پرسرعت XFCE ===
+              # === ۳. مسیر اصلی: ریموت دسکتاپ پرسرعت XFCE ===
               location / {
                   proxy_pass http://kasm_backend;
                   proxy_http_version 1.1;
@@ -539,61 +656,52 @@ jobs:
                   proxy_set_header Host $host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_set_header X-Forwarded-Proto $forwarded_proto;
 
                   proxy_buffering off;
                   proxy_request_buffering off;
-                  proxy_connect_timeout 2s;
+                  proxy_cache off;
+                  proxy_connect_timeout 5s;
                   proxy_read_timeout 86400s;
                   proxy_send_timeout 86400s;
                   proxy_socket_keepalive on;
               }
 
               # === ۴. وضعیت سلامت سرور ===
-              location /health {
-                  access_log off;
+              location = /health {
                   default_type application/json;
                   return 200 '{"status":"ok","timestamp":"$time_iso8601"}';
               }
           }
           SITE
 
+          # افزودن قابلیت خودترمیمی systemd برای Nginx
+          sudo mkdir -p /etc/systemd/system/nginx.service.d
+          cat <<'OVERRIDE' | sudo tee /etc/systemd/system/nginx.service.d/override.conf > /dev/null
+          [Service]
+          Restart=always
+          RestartSec=2
+          LimitNOFILE=1048576
+          OVERRIDE
+
           sudo ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
           sudo nginx -t
+          sudo systemctl daemon-reload
           sudo systemctl restart nginx
-          echo "✅ Nginx مالتی‌پلکسر با Keepalive واقعی و WebSocket بهینه اجرا شد."
 
+          curl -sf http://127.0.0.1:8000/health > /dev/null
+          echo "✅ Nginx مالتی‌پلکسر (ایزوله روی 127.0.0.1:8000) با موفقیت اجرا و تأیید شد."
+
+      # === ۵. راه‌اندازی سرویس‌های ttyd و Cloudflare Tunnel تحت مدیریت Systemd ===
       - name: 5. Launch Services & Cloudflare Tunnel (Systemd Managed & Verified)
         run: |
-          # === ۱. کانفیگ اختصاصی tmux و سرویس systemd برای ttyd ===
+          # === ۱. کانفیگ اختصاصی tmux و سرویس ttyd (محدود به 127.0.0.1 و بدون پسورد در ps) ===
           cat <<'TMUX' | sudo tee /home/prxcore/.tmux.conf > /dev/null
           set -g mouse on
           set -g history-limit 10000
           set -g default-terminal "screen-256color"
           TMUX
           sudo chown -R prxcore:prxcore /home/prxcore
-
-          printf 'PRX_USER_PASS=%q\n' "$PRX_USER_PASS" | sudo tee /etc/ttyd.env > /dev/null
-          sudo chown prxcore:prxcore /etc/ttyd.env
-          sudo chmod 600 /etc/ttyd.env
-
-          cat <<'TTYD_RUN' | sudo tee /usr/local/bin/start-ttyd.sh > /dev/null
-          #!/bin/bash
-          source /etc/ttyd.env
-          export HOME=/home/prxcore
-          export XDG_CONFIG_HOME=/home/prxcore/.config
-          cd /home/prxcore || exit 1
-          exec /usr/local/bin/ttyd \
-            -c "prxcore:$PRX_USER_PASS" \
-            -W \
-            -p 7681 \
-            -b /terminal \
-            -t fontSize=16 \
-            -t 'theme={"background": "#0f172a"}' \
-            -t rendererType=webgl \
-            tmux -f /home/prxcore/.tmux.conf new-session -A -s prxcore_workspace
-          TTYD_RUN
-          sudo chmod +x /usr/local/bin/start-ttyd.sh
 
           cat <<'SERVICE' | sudo tee /etc/systemd/system/ttyd.service > /dev/null
           [Unit]
@@ -608,7 +716,7 @@ jobs:
           Environment=HOME=/home/prxcore
           Environment=XDG_CONFIG_HOME=/home/prxcore/.config
           Environment=TERM=xterm-256color
-          ExecStart=/usr/local/bin/start-ttyd.sh
+          ExecStart=/usr/local/bin/ttyd -i 127.0.0.1 -W -p 7681 -b /terminal -t fontSize=16 -t 'theme={"background":"#0f172a"}' -t enableWebgl=true -t disableLeaveAlert=true tmux -f /home/prxcore/.tmux.conf new-session -A -s prxcore_workspace
           Restart=always
           RestartSec=2
 
@@ -616,7 +724,7 @@ jobs:
           WantedBy=multi-user.target
           SERVICE
 
-          # === ۲. سرویس systemd امن برای Cloudflare Tunnel (بدون نمایش توکن در ps) ===
+          # === ۲. سرویس systemd امن برای Cloudflare Tunnel (مدیریت‌شده با Token) ===
           CLEAN_CF_TOKEN=$(printf '%s' "$CF_TOKEN" | tr -d '\r\n ')
           printf 'TUNNEL_TOKEN=%s\n' "$CLEAN_CF_TOKEN" | sudo tee /etc/cloudflared.env > /dev/null
           sudo chmod 600 /etc/cloudflared.env
@@ -630,7 +738,7 @@ jobs:
           [Service]
           Type=simple
           EnvironmentFile=/etc/cloudflared.env
-          ExecStart=/usr/local/bin/cloudflared tunnel --protocol http2 --url http://127.0.0.1:8000 --no-autoupdate --edge-ip-version 4 --grace-period 30s --retries 15 run
+          ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --edge-ip-version 4 --protocol http2 --grace-period 30s --retries 15 run
           Restart=always
           RestartSec=2
           LimitNOFILE=1048576
@@ -646,17 +754,17 @@ jobs:
           # بررسی سلامت ttyd
           sleep 2
           if sudo systemctl is-active --quiet ttyd; then
-            echo "✅ سرویس وب‌ترمینال (ttyd) با محیط ایزوله prxcore اجرا شد."
+            echo "✅ سرویس وب‌ترمینال (ttyd) با محیط ایزوله و پورت محلی 127.0.0.1:7681 اجرا شد."
           else
             echo "❌ خطا در اجرای ttyd:"
             sudo journalctl -u ttyd --no-pager -n 20
             exit 1
           fi
 
-          # انتظار هوشمند تا ثبت واقعی اتصال تانل در Edge کلودفلر (حداکثر ۲۰ ثانیه)
+          # انتظار هوشمند تا ثبت واقعی اتصال تانل در Edge کلودفلر (حداکثر ۴۰ ثانیه)
           echo "⏳ در حال بررسی اتصال تانل به سرورهای Edge کلودفلر..."
           CF_CONNECTED=0
-          for i in {1..10}; do
+          for i in {1..20}; do
             if sudo journalctl -u cloudflared --no-pager | grep -q "Registered tunnel connection"; then
               CF_CONNECTED=1
               break
@@ -674,10 +782,19 @@ jobs:
             exit 1
           fi
 
-      - name: 6. Generate Connection Info & Keep Alive (Safe Margin Before Timeout)
+      # === ۶. نمایش اطلاعات اتصال، تایمر پویا و واچ‌داگ خودترمیمی ===
+      - name: 6. Generate Connection Info & Self-Healing Keep Alive
         run: |
-          # لینک VLESS مجهز به Early Data (ed=2048) و بدون قفل محدودکننده ALPN
           VLESS_LINK="vless://$PRX_UUID@$PRX_DOMAIN:443?path=%2Fprx-stream%3Fed%3D2048&security=tls&encryption=none&type=ws&sni=$PRX_DOMAIN&host=$PRX_DOMAIN&fp=chrome#PRX-Ultra"
+
+          # محاسبه دقیق زمان باقی‌مانده از لحظه شروع جاب (حداقل ۱۸ دقیقه حاشیه امن برای ذخیره کش)
+          DEADLINE_EPOCH=$((JOB_START_EPOCH + TARGET_TOTAL_MINUTES * 60))
+          NOW_EPOCH=$(date +%s)
+          REMAINING_SECS=$((DEADLINE_EPOCH - NOW_EPOCH))
+          REMAINING_MINS=$((REMAINING_SECS / 60))
+          if [ "$REMAINING_MINS" -lt 1 ]; then
+            REMAINING_MINS=1
+          fi
 
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
@@ -690,70 +807,107 @@ jobs:
           echo "║  🔐 Password:                [Defined in PRX_USER_PASS]  ║"
           echo "║                                                          ║"
           echo "╠══════════════════════════════════════════════════════════╣"
-          echo "║  ⚡ Ultra Optimizations Applied:                        ║"
-          echo "║    ✅ Full XFCE Desktop + Native X11 Key Mapping        ║"
-          echo "║    ✅ Dual Language Keyboard (English + Persian)         ║"
-          echo "║    ✅ Toggle Shortcut: Alt + Shift                       ║"
-          echo "║    ✅ Google Chrome Official (QUIC Disabled for Gemini)  ║"
-          echo "║    ✅ Systemd Managed Services (Xray + ttyd + CF Tunnel) ║"
-          echo "║    ✅ WS Heartbeat (20s) + 0-RTT EarlyData (ed=2048)     ║"
-          echo "║    ✅ 4GB Safe Shared RAM (shm) + Host IPC Mode          ║"
-          echo "║    ✅ BBR + MTU Probing + QUIC Blocked in Xray          ║"
-          echo "║    ✅ Safe Conditional Cache Save on Manual Cancel       ║"
+          echo "║  ⚡ Optimizations & Security Applied:                    ║"
+          echo "║    ✅ Isolated 4GB /dev/shm RAM (No --ipc=host conflict) ║"
+          echo "║    ✅ Google Chrome Official (QUIC Disabled, 2 Raster)   ║"
+          echo "║    ✅ Xray 512KB Buffer + Heartbeat + SSRF Protection    ║"
+          echo "║    ✅ Localhost-Only Nginx + Hashed Auth + HTTPS Proto   ║"
+          echo "║    ✅ Dynamic Deadline Timer + Active Self-Healing       ║"
+          echo "║    ✅ Graceful Chrome Flush & Deep Multi-Profile Clean   ║"
           echo "╠══════════════════════════════════════════════════════════╣"
-          echo "║  🚀 VLESS Connection Link:                              ║"
+          echo "║  🚀 VLESS Connection Link:                               ║"
           echo "╚══════════════════════════════════════════════════════════╝"
           echo ""
           echo "$VLESS_LINK"
           echo ""
-          echo "⏱️ سرور تا ۵ ساعت و ۴۵ دقیقه فعال می‌ماند و سپس ۱۵ دقیقه صرف ذخیره امن کوکی‌ها می‌شود..."
+          echo "⏱️ سرور حدود ${REMAINING_MINS} دقیقه فعال می‌ماند (حاشیه امن خودکار پیش از سقف ۳۶۰ دقیقه‌ای گیت‌هاب)..."
           echo "=================================================="
 
-          # شکار سیگنال Cancel گیت‌هاب برای خروج فوری و اجرای مرحله ذخیره کش کوکی‌ها
+          # شکار سیگنال Cancel گیت‌هاب برای خروج فوری و ذخیره امن کوکی‌ها
           SLEEP_PID=""
           trap 'echo "⚠️ سیگنال توقف دریافت شد! خروج فوری برای ذخیره امن کوکی‌ها..."; [ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null || true; exit 0' SIGINT SIGTERM
 
-          # ۳۴۵ دقیقه (۵ ساعت و ۴۵ دقیقه) جهت تضمین اجرای کامل مراحل ۷ و ۸ قبل از سقف ۳۶۰ دقیقه‌ای گیت‌هاب
-          for i in $(seq 1 345); do
+          MINUTE=0
+          while [ "$(date +%s)" -lt "$DEADLINE_EPOCH" ]; do
             sleep 60 &
             SLEEP_PID=$!
             wait "$SLEEP_PID"
-            if [ $((i % 10)) -eq 0 ]; then
-              CF_UP=$(pgrep -c -x "cloudflared" 2>/dev/null || echo "0")
-              XRAY_UP=$(pgrep -c -x "xray" 2>/dev/null || echo "0")
-              NGINX_UP=$(pgrep -c -x "nginx" 2>/dev/null || echo "0")
-              TTYD_UP=$(pgrep -c -x "ttyd" 2>/dev/null || echo "0")
-              KASM_UP=$(sudo docker inspect -f '{{.State.Running}}' kasm-chrome 2>/dev/null || echo "false")
-              echo "[$i/345] 📊 Status: CF=$CF_UP | Xray=$XRAY_UP | Nginx=$NGINX_UP | ttyd=$TTYD_UP | Kasm=$KASM_UP"
+            MINUTE=$((MINUTE + 1))
+
+            # بررسی وضعیت سرویس‌ها (بدون باگ خروجی دوتایی pgrep -c)
+            CF_UP=$(pgrep -c -x "cloudflared" 2>/dev/null || true)
+            XRAY_UP=$(pgrep -c -x "xray" 2>/dev/null || true)
+            NGINX_UP=$(pgrep -c -x "nginx" 2>/dev/null || true)
+            TTYD_UP=$(pgrep -c -x "ttyd" 2>/dev/null || true)
+            KASM_UP=$(sudo docker inspect -f '{{.State.Running}}' kasm-chrome 2>/dev/null || echo "false")
+
+            # خودترمیمی فعال در صورت توقف غیرمنتظره هر سرویس
+            [ "${CF_UP:-0}" -eq 0 ] && { echo "🔄 ری‌استارت خودکار cloudflared..."; sudo systemctl restart cloudflared || true; }
+            [ "${XRAY_UP:-0}" -eq 0 ] && { echo "🔄 ری‌استارت خودکار xray..."; sudo systemctl restart xray || true; }
+            [ "${NGINX_UP:-0}" -eq 0 ] && { echo "🔄 ری‌استارت خودکار nginx..."; sudo systemctl restart nginx || true; }
+            [ "${TTYD_UP:-0}" -eq 0 ] && { echo "🔄 ری‌استارت خودکار ttyd..."; sudo systemctl restart ttyd || true; }
+            [ "$KASM_UP" != "true" ] && { echo "🔄 ری‌استارت خودکار کانتینر kasm-chrome..."; sudo docker start kasm-chrome || true; }
+
+            if [ $((MINUTE % 10)) -eq 0 ]; then
+              MEM_USED=$(free -h | awk '/^Mem:/ {print $3 "/" $2}')
+              DISK_USED=$(df -h / | awk 'NR==2 {print $5}')
+              LEFT_MINS=$(( (DEADLINE_EPOCH - $(date +%s)) / 60 ))
+              echo "[+${MINUTE}m | -${LEFT_MINS}m] 📊 CF=${CF_UP:-0} | Xray=${XRAY_UP:-0} | Nginx=${NGINX_UP:-0} | ttyd=${TTYD_UP:-0} | Kasm=$KASM_UP | RAM=$MEM_USED | Disk=$DISK_USED"
             else
-              echo "[$i/345] 🟢 Running on $PRX_DOMAIN (HTTP/2 Stable)"
+              echo "[+${MINUTE}m] 🟢 Running on $PRX_DOMAIN (HTTP/2 Stable)"
             fi
           done
-          echo "⏰ زمان کاری به پایان رسید. در حال ذخیره ایمن کوکی‌ها و پروفایل..."
+          echo "⏰ زمان کاری به پایان رسید. ورود به مرحله بستن امن مرورگر و ذخیره پروفایل..."
 
-      # === ۷. متوقف کردن ایمن کانتینر برای ذخیره نهایی کوکی‌ها و پاکسازی کش‌های حجیم و موقت ===
-      - name: 7. Gracefully Stop Browser & Clean Sockets
+      # === ۷. بستن تمیز کروم برای ثبت کامل کوکی‌ها، توقف کانتینر و پاکسازی عمیق کش‌های زائد ===
+      - name: 7. Gracefully Close Chrome, Stop Container & Deep Clean Caches
         if: always() && steps.setup_desktop.outcome == 'success'
         run: |
-          echo "⏹️ متوقف کردن ایمن کانتینر برای ثبت نهایی کوکی‌ها..."
-          sudo docker stop kasm-chrome -t 10 2>/dev/null || true
+          echo "⏹️ ارسال سیگنال خروج امن به Google Chrome برای ثبت کامل کوکی‌ها و SQLite..."
+          sudo docker exec kasm-chrome pkill -TERM -f "/opt/google/chrome/chrome" 2>/dev/null || true
 
-          # حذف فایل‌های موقت، قفل‌ها، سوکت‌ها و کش‌های حجیم کروم (با حفظ کامل کوکی‌ها، پسوردها و افزونه‌ها)
-          sudo rm -rf /home/runner/kasm_data/.cache \
-                      /home/runner/kasm_data/Singleton* \
-                      /home/runner/kasm_data/.config/google-chrome/Singleton* \
-                      /home/runner/kasm_data/.config/google-chrome/Default/Cache \
-                      /home/runner/kasm_data/.config/google-chrome/Default/Code\ Cache \
-                      /home/runner/kasm_data/.config/google-chrome/Default/GPUCache \
-                      /home/runner/kasm_data/.config/google-chrome/Default/Service\ Worker/CacheStorage \
-                      /home/runner/kasm_data/.config/google-chrome/ShaderCache \
-                      /home/runner/kasm_data/.X11-unix \
-                      /home/runner/kasm_data/tmp 2>/dev/null || true
+          # انتظار حداکثر ۱۰ ثانیه برای بسته شدن تمیز تمام پروسه‌های کروم
+          for i in {1..10}; do
+            if ! sudo docker exec kasm-chrome pgrep -f "/opt/google/chrome/chrome" >/dev/null 2>&1; then
+              echo "✅ کروم با موفقیت و بدون خطا بسته شد."
+              break
+            fi
+            sleep 1
+          done
 
-          # آزادسازی دسترسی ایمن برای کاربر runner جهت ساخت آرشیو کش بدون خراب کردن پرمیشن‌ها
+          echo "⏹️ متوقف کردن ایمن کانتینر Webtop..."
+          sudo docker stop kasm-chrome -t 15 2>/dev/null || true
+
+          # پاکسازی عمیق کش‌های حجیم و فایل‌های قفل تمام پروفایل‌ها (با حفظ کامل کوکی‌ها، پسوردها، LocalStorage و افزونه‌ها)
+          sudo rm -rf \
+            /home/runner/kasm_data/.cache \
+            /home/runner/kasm_data/.local/share/Trash \
+            /home/runner/kasm_data/.X11-unix \
+            /home/runner/kasm_data/tmp \
+            /home/runner/kasm_data/Singleton* \
+            /home/runner/kasm_data/.config/google-chrome/Singleton* \
+            /home/runner/kasm_data/.config/google-chrome/ShaderCache \
+            /home/runner/kasm_data/.config/google-chrome/GrShaderCache \
+            /home/runner/kasm_data/.config/google-chrome/GraphiteDawnCache \
+            /home/runner/kasm_data/.config/google-chrome/Crashpad \
+            /home/runner/kasm_data/.config/google-chrome/BrowserMetrics \
+            /home/runner/kasm_data/.config/google-chrome/OptGuideOnDeviceModel \
+            /home/runner/kasm_data/.config/google-chrome/OptimizationGuide* \
+            /home/runner/kasm_data/.config/google-chrome/Safe\ Browsing* \
+            /home/runner/kasm_data/.config/google-chrome/*/Cache \
+            /home/runner/kasm_data/.config/google-chrome/*/Cache_Data \
+            /home/runner/kasm_data/.config/google-chrome/*/Code\ Cache \
+            /home/runner/kasm_data/.config/google-chrome/*/GPUCache \
+            /home/runner/kasm_data/.config/google-chrome/*/Dawn*Cache \
+            /home/runner/kasm_data/.config/google-chrome/*/Service\ Worker/CacheStorage \
+            /home/runner/kasm_data/.config/google-chrome/*/Service\ Worker/ScriptCache 2>/dev/null || true
+
+          # آزادسازی دسترسی ایمن برای کاربر runner جهت ساخت آرشیو کش
           sudo chown -R runner:docker /home/runner/kasm_data
           sudo chmod -R u+rwX /home/runner/kasm_data
-          echo "✅ داده‌های پروفایل با موفقیت پاکسازی و آماده ذخیره‌سازی شدند."
+
+          PROFILE_SIZE=$(du -sh /home/runner/kasm_data 2>/dev/null | cut -f1)
+          echo "✅ داده‌های پروفایل پاکسازی و آماده ذخیره‌سازی شدند (حجم نهایی آرشیو: ${PROFILE_SIZE:-unknown})."
 
       # === ۸. ذخیره‌سازی آرشیو سشن‌ها و کوکی‌ها در گیت‌هاب ===
       - name: 8. Save Persistent Browser Profile & Cookies
