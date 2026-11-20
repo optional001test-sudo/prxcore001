@@ -578,13 +578,15 @@ jobs:
               --edge-ip-version 4 \
               --grace-period 30s \
               --retries 15 \
-              run --token "$CF_TOKEN" >> /tmp/cf_tunnel.log 2>&1
+              run --token "$TUNNEL_TOKEN" >> /tmp/cf_tunnel.log 2>&1
             sleep 2
           done
           LAUNCHER
           sudo chmod +x /usr/local/bin/run_cloudflared.sh
 
-          sudo -E nohup /usr/local/bin/run_cloudflared.sh > /dev/null 2>&1 &
+          # پاکسازی فاصله یا خط جدید احتمالی در توکن و اجرا بدون sudo تا متغیر محیطی حفظ شود
+          CLEAN_CF_TOKEN=$(printf '%s' "$CF_TOKEN" | tr -d '\r\n ')
+          TUNNEL_TOKEN="$CLEAN_CF_TOKEN" nohup /usr/local/bin/run_cloudflared.sh > /dev/null 2>&1 &
           sleep 8
 
           echo "📋 آخرین لاگ‌های cloudflared:"
