@@ -568,32 +568,34 @@ jobs:
           sleep 2
 
           # اجرای پایدار کلودفلرد با پروتکل http2 و حفظ فلگ --url برای توکن‌های CLI
-          cat <<'LAUNCHER' | sudo tee /usr/local/bin/run_cloudflared.sh > /dev/null
-          #!/bin/bash
-          while true; do
-            /usr/local/bin/cloudflared tunnel \
-              --protocol http2 \
-              --url http://127.0.0.1:8000 \
-              --no-autoupdate \
-              --edge-ip-version 4 \
-              --grace-period 30s \
-              --retries 15 \
-              run --token "$CF_TOKEN" >> /tmp/cf_tunnel.log 2>&1
-            sleep 2
-          done
-          LAUNCHER
-          sudo chmod +x /usr/local/bin/run_cloudflared.sh
+       cat <<'LAUNCHER' | sudo tee /usr/local/bin/run_cloudflared.sh > /dev/null
+       #!/bin/bash
+       while true; do
+         /usr/local/bin/cloudflared tunnel \
+           --protocol http2 \
+           --url http://127.0.0.1:8000 \
+           --no-autoupdate \
+           --edge-ip-version 4 \
+           --grace-period 30s \
+           --retries 15 \
+           run --token "$CF_TOKEN" >> /tmp/cf_tunnel.log 2>&1
+         sleep 2
+       done
+       LAUNCHER
+       sudo chmod +x /usr/local/bin/run_cloudflared.sh
 
-          sudo -E nohup /usr/local/bin/run_cloudflared.sh > /dev/null 2>&1 &
-          sleep 6
+       sudo -E nohup /usr/local/bin/run_cloudflared.sh > /dev/null 2>&1 &
+       sleep 8
 
-          if pgrep -f "cloudflared" > /dev/null 2>&1; then
-            echo "✅ Cloudflare Tunnel با پروتکل HTTP/2 با موفقیت اجرا شد."
-          else
-            echo "❌ خطا در استارت اولیه کلودفلرد:"
-            tail -n 20 /tmp/cf_tunnel.log
-            exit 1
-          fi
+       echo "📋 آخرین لاگ‌های cloudflared:"
+       tail -n 25 /tmp/cf_tunnel.log || true
+
+       if pgrep -x "cloudflared" > /dev/null 2>&1; then
+         echo "✅ باینری Cloudflare Tunnel در حال اجراست."
+       else
+         echo "❌ باینری cloudflared متوقف شد یا کرش کرد!"
+         exit 1
+       fi
 
       - name: 6. Generate Connection Info & Keep Alive (Safe Margin Before Timeout)
         run: |
@@ -637,7 +639,7 @@ jobs:
             sleep 60 &
             wait $!
             if [ $((i % 10)) -eq 0 ]; then
-              CF_UP=$(pgrep -c -f "cloudflared" 2>/dev/null || echo "0")
+              CF_UP=$(pgrep -c -x "cloudflared" 2>/dev/null || echo "0")
               XRAY_UP=$(pgrep -c -f "xray" 2>/dev/null || echo "0")
               KASM_UP=$(sudo docker inspect -f '{{.State.Running}}' kasm-chrome 2>/dev/null || echo "false")
               echo "[$i/345] 📊 Status: Proto=HTTP/2 | CF=$CF_UP | Xray=$XRAY_UP | Kasm=$KASM_UP"
