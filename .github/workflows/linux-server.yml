@@ -112,11 +112,15 @@ jobs:
           echo "✅ تنظیمات کرنل، DNS پایدار، BBR، MTU Probing و TCP MSS Clamping اعمال شدند."
 
       - name: 2. Setup Secure User, Dependencies & Deploy Extreme Webtop XFCE Desktop
+        id: setup_desktop
         run: |
           id -u prxcore &>/dev/null || sudo useradd -m -s /bin/bash prxcore
           echo "prxcore:$PRX_USER_PASS" | sudo chpasswd
           sudo usermod -aG sudo prxcore
           echo "prxcore ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/prxcore > /dev/null
+          sudo chmod 440 /etc/sudoers.d/prxcore
+          sudo mkdir -p /home/prxcore/.config/tmux
+          sudo chown -R prxcore:prxcore /home/prxcore
 
           # --- حذف میرور ناپایدار آژور (azure.archive.ubuntu.com) و جایگزینی با مخازن اصلی اوبونتو ---
           if [ -f /etc/apt/apt-mirrors.txt ]; then
@@ -134,15 +138,19 @@ jobs:
           sudo apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true -o Acquire::http::Timeout="15" update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y \
             htop tmux curl wget unzip nginx qrencode jq -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::ForceIPv4=true install -y fastfetch -qq 2>/dev/null || \
-            sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::ForceIPv4=true install -y neofetch -qq 2>/dev/null || true
 
-          # دانلود ttyd
-          sudo wget -q -nc https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -O /usr/local/bin/ttyd
+          # نصب fastfetch (از مخزن یا نسخه رسمی گیت‌هاب در صورت نبودن در ریپوی اوبونتو)
+          if ! sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::ForceIPv4=true install -y fastfetch -qq 2>/dev/null; then
+            curl -fsSL --retry 3 https://github.com/fastfetch-cli/fastfetch/releases/latest/download/fastfetch-linux-amd64.deb -o /tmp/fastfetch.deb 2>/dev/null && \
+              sudo dpkg -i /tmp/fastfetch.deb >/dev/null 2>&1 || true
+            rm -f /tmp/fastfetch.deb
+          fi
+
+          # دانلود پایدار ttyd و cloudflared با قابلیت Retry و اعتبارسنجی
+          sudo curl -fsSL --retry 5 --retry-delay 2 https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -o /usr/local/bin/ttyd
           sudo chmod +x /usr/local/bin/ttyd
 
-          # دانلود cloudflared
-          sudo wget -q -nc https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared
+          sudo curl -fsSL --retry 5 --retry-delay 2 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
           sudo chmod +x /usr/local/bin/cloudflared
 
           # آماده‌سازی دایرکتوری پایدار پروفایل و پوشه‌های کانفیگ XFCE
@@ -221,18 +229,22 @@ jobs:
             sleep 1
           done
 
-          # نصب فونت‌های فارسی، ابزار کیبورد و مرورگر اصلی Google Chrome در کانتینر
+          # نصب مستقل فونت‌های فارسی، ابزار کیبورد و مرورگر Google Chrome بدون شکست خاموش
           echo "⏳ در حال نصب فونت‌های فارسی و Google Chrome روی میزکار..."
-          sudo docker exec -u 0 kasm-chrome bash -c "
-            apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update -qq && \
-            DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y -qq fonts-vazirmatn fonts-farsiweb x11-xkb-utils wget && \
-            wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb && \
-            apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y -qq /tmp/chrome.deb && \
+          sudo docker exec -u 0 kasm-chrome bash -c '
+            set -e
+            apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y -qq x11-xkb-utils wget ca-certificates
+            DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::ForceIPv4=true install -y -qq fonts-vazirmatn 2>/dev/null || true
+            DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::ForceIPv4=true install -y -qq fonts-farsiweb 2>/dev/null || true
+            wget -q --tries=5 https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb
+            DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y -qq /tmp/chrome.deb || \
+              DEBIAN_FRONTEND=noninteractive apt-get -f install -y -qq
             rm -f /tmp/chrome.deb
-          " 2>/dev/null || true
+          '
 
-          # اعمال نقشه کیبورد و اجرای خودکار کروم (با QUIC غیرفعال) پس از نصب در محیط دسکتاپ
-          sudo docker exec -u 1000 -e DISPLAY=:1 kasm-chrome bash -c "
+          # اعمال نقشه کیبورد و اجرای خودکار کروم (با QUIC غیرفعال) با HOME صحیح در کانتینر
+          sudo docker exec -u 1000 -e DISPLAY=:1 -e HOME=/config kasm-chrome bash -c "
             setxkbmap -layout 'us,ir' -option 'grp:alt_shift_toggle' 2>/dev/null || true
             pgrep -f google-chrome >/dev/null || nohup /usr/bin/google-chrome-stable --no-sandbox --disable-dev-shm-usage --password-store=basic --disable-quic --num-raster-threads=4 --enable-webgl --ignore-gpu-blocklist --enable-unsafe-swiftshader >/dev/null 2>&1 &
           " 2>/dev/null || true
@@ -242,13 +254,13 @@ jobs:
       - name: 3. Install & Configure Xray-Core (Fully Optimized VLESS WS with Heartbeat & EarlyData)
         run: |
           export TERM=xterm-256color
-          curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/install-xray.sh
+          curl -fsSL --retry 5 https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/install-xray.sh
           sed -i 's/tput setaf [0-9]/true/g; s/tput sgr0/true/g' /tmp/install-xray.sh
 
           if ! sudo env TERM=xterm-256color bash /tmp/install-xray.sh install; then
             echo "⚠️ اسکریپت نصب با محدودیت مواجه شد؛ در حال نصب مستقیم هسته Xray..."
             sudo mkdir -p /usr/local/bin /usr/local/share/xray /usr/local/etc/xray
-            curl -fsSL https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o /tmp/xray.zip
+            curl -fsSL --retry 5 https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o /tmp/xray.zip
             sudo unzip -qo /tmp/xray.zip -d /usr/local/bin/
             sudo chmod +x /usr/local/bin/xray
             sudo mv -f /usr/local/bin/*.dat /usr/local/share/xray/ 2>/dev/null || true
@@ -281,7 +293,7 @@ jobs:
           cat <<EOF | sudo tee /usr/local/etc/xray/config.json > /dev/null
           {
             "log": {
-              "loglevel": "none",
+              "loglevel": "warning",
               "access": "none"
             },
             "dns": {
@@ -313,9 +325,7 @@ jobs:
                   "network": "ws",
                   "wsSettings": {
                     "path": "/prx-stream",
-                    "heartbeatPeriod": 20,
-                    "maxEarlyData": 2048,
-                    "earlyDataHeaderName": "Sec-WebSocket-Protocol"
+                    "heartbeatPeriod": 20
                   },
                   "sockopt": {
                     "tcpNoDelay": true,
@@ -395,6 +405,9 @@ jobs:
           }
           EOF
 
+          # تست اعتبارسنجی کانفیگ Xray پیش از اجرا
+          sudo /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json
+
           sudo systemctl daemon-reload
           sudo systemctl enable xray
           sudo systemctl restart xray
@@ -404,13 +417,13 @@ jobs:
             echo "✅ Xray با پینگ خودکار (Heartbeat)، پشتیبانی 0-RTT و بافر ضد Bufferbloat اجرا شد."
           else
             echo "❌ خطا در اجرای Xray:"
-            sudo journalctl -u xray --no-pager -n 20
+            sudo journalctl -u xray --no-pager -n 25
             exit 1
           fi
 
-      - name: 4. Configure Nginx Ultra Multiplexer (No-Lag WebSocket & Map Handling)
+      - name: 4. Configure Nginx Ultra Multiplexer (No-Lag WebSocket & True Upstream Keepalive)
         run: |
-          cat <<'MAIN' | sudo tee /etc/nginx/nginx.conf
+          cat <<'MAIN' | sudo tee /etc/nginx/nginx.conf > /dev/null
           user www-data;
           worker_processes auto;
           worker_rlimit_nofile 131072;
@@ -425,7 +438,7 @@ jobs:
           http {
               map $http_upgrade $connection_upgrade {
                   default upgrade;
-                  '' close;
+                  '' "";
               }
 
               sendfile on;
@@ -448,7 +461,7 @@ jobs:
           }
           MAIN
 
-          cat <<'SITE' | sudo tee /etc/nginx/sites-available/default
+          cat <<'SITE' | sudo tee /etc/nginx/sites-available/default > /dev/null
           upstream xray_backend {
               server 127.0.0.1:8080;
               keepalive 512;
@@ -490,6 +503,7 @@ jobs:
                   proxy_request_buffering off;
                   proxy_cache off;
                   tcp_nodelay on;
+                  proxy_connect_timeout 5s;
                   proxy_read_timeout 86400s;
                   proxy_send_timeout 86400s;
                   proxy_socket_keepalive on;
@@ -544,19 +558,32 @@ jobs:
           }
           SITE
 
+          sudo ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
           sudo nginx -t
-          if [ $? -eq 0 ]; then
-            sudo systemctl restart nginx
-            echo "✅ Nginx مالتی‌پلکسر با بهینه‌سازی جدید اجرا شد."
-          else
-            echo "❌ خطا در کانفیگ Nginx!"
-            exit 1
-          fi
+          sudo systemctl restart nginx
+          echo "✅ Nginx مالتی‌پلکسر با Keepalive واقعی و WebSocket بهینه اجرا شد."
 
-      - name: 5. Launch Services & Cloudflare Tunnel (Stable HTTP/2 Engine)
+      - name: 5. Launch Services & Cloudflare Tunnel (Systemd Managed & Verified)
         run: |
-          # اجرای ttyd روی پورت 7681 با کاربر prxcore و اصلاح کامل متغیرهای محیطی
-          sudo -H -u prxcore env HOME=/home/prxcore XDG_CONFIG_HOME=/home/prxcore/.config nohup /usr/local/bin/ttyd \
+          # === ۱. کانفیگ اختصاصی tmux و سرویس systemd برای ttyd ===
+          cat <<'TMUX' | sudo tee /home/prxcore/.tmux.conf > /dev/null
+          set -g mouse on
+          set -g history-limit 10000
+          set -g default-terminal "screen-256color"
+          TMUX
+          sudo chown -R prxcore:prxcore /home/prxcore
+
+          printf 'PRX_USER_PASS=%q\n' "$PRX_USER_PASS" | sudo tee /etc/ttyd.env > /dev/null
+          sudo chown prxcore:prxcore /etc/ttyd.env
+          sudo chmod 600 /etc/ttyd.env
+
+          cat <<'TTYD_RUN' | sudo tee /usr/local/bin/start-ttyd.sh > /dev/null
+          #!/bin/bash
+          source /etc/ttyd.env
+          export HOME=/home/prxcore
+          export XDG_CONFIG_HOME=/home/prxcore/.config
+          cd /home/prxcore || exit 1
+          exec /usr/local/bin/ttyd \
             -c "prxcore:$PRX_USER_PASS" \
             -W \
             -p 7681 \
@@ -564,38 +591,86 @@ jobs:
             -t fontSize=16 \
             -t 'theme={"background": "#0f172a"}' \
             -t rendererType=webgl \
-            tmux -f /dev/null new-session -A -s prxcore_workspace > /tmp/ttyd.log 2>&1 &
-          sleep 2
+            tmux -f /home/prxcore/.tmux.conf new-session -A -s prxcore_workspace
+          TTYD_RUN
+          sudo chmod +x /usr/local/bin/start-ttyd.sh
 
-          # اجرای پایدار کلودفلرد با پروتکل http2 و حفظ فلگ --url برای توکن‌های CLI
-          cat <<'LAUNCHER' | sudo tee /usr/local/bin/run_cloudflared.sh > /dev/null
-          #!/bin/bash
-          while true; do
-            /usr/local/bin/cloudflared tunnel \
-              --protocol http2 \
-              --url http://127.0.0.1:8000 \
-              --no-autoupdate \
-              --edge-ip-version 4 \
-              --grace-period 30s \
-              --retries 15 \
-              run --token "$TUNNEL_TOKEN" >> /tmp/cf_tunnel.log 2>&1
+          cat <<'SERVICE' | sudo tee /etc/systemd/system/ttyd.service > /dev/null
+          [Unit]
+          Description=ttyd Web Terminal (prxcore)
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=prxcore
+          Group=prxcore
+          WorkingDirectory=/home/prxcore
+          Environment=HOME=/home/prxcore
+          Environment=XDG_CONFIG_HOME=/home/prxcore/.config
+          Environment=TERM=xterm-256color
+          ExecStart=/usr/local/bin/start-ttyd.sh
+          Restart=always
+          RestartSec=2
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
+          # === ۲. سرویس systemd امن برای Cloudflare Tunnel (بدون نمایش توکن در ps) ===
+          CLEAN_CF_TOKEN=$(printf '%s' "$CF_TOKEN" | tr -d '\r\n ')
+          printf 'TUNNEL_TOKEN=%s\n' "$CLEAN_CF_TOKEN" | sudo tee /etc/cloudflared.env > /dev/null
+          sudo chmod 600 /etc/cloudflared.env
+
+          cat <<'SERVICE' | sudo tee /etc/systemd/system/cloudflared.service > /dev/null
+          [Unit]
+          Description=Cloudflare Tunnel (HTTP/2 Stable)
+          After=network-online.target nginx.service
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          EnvironmentFile=/etc/cloudflared.env
+          ExecStart=/usr/local/bin/cloudflared tunnel --protocol http2 --url http://127.0.0.1:8000 --no-autoupdate --edge-ip-version 4 --grace-period 30s --retries 15 run
+          Restart=always
+          RestartSec=2
+          LimitNOFILE=1048576
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now ttyd
+          sudo systemctl enable --now cloudflared
+
+          # بررسی سلامت ttyd
+          sleep 2
+          if sudo systemctl is-active --quiet ttyd; then
+            echo "✅ سرویس وب‌ترمینال (ttyd) با محیط ایزوله prxcore اجرا شد."
+          else
+            echo "❌ خطا در اجرای ttyd:"
+            sudo journalctl -u ttyd --no-pager -n 20
+            exit 1
+          fi
+
+          # انتظار هوشمند تا ثبت واقعی اتصال تانل در Edge کلودفلر (حداکثر ۲۰ ثانیه)
+          echo "⏳ در حال بررسی اتصال تانل به سرورهای Edge کلودفلر..."
+          CF_CONNECTED=0
+          for i in {1..10}; do
+            if sudo journalctl -u cloudflared --no-pager | grep -q "Registered tunnel connection"; then
+              CF_CONNECTED=1
+              break
+            fi
             sleep 2
           done
-          LAUNCHER
-          sudo chmod +x /usr/local/bin/run_cloudflared.sh
-
-          # پاکسازی کاراکترهای اضافه احتمالی در توکن و اجرا بدون sudo جهت حفظ متغیر محیطی
-          CLEAN_CF_TOKEN=$(printf '%s' "$CF_TOKEN" | tr -d '\r\n ')
-          TUNNEL_TOKEN="$CLEAN_CF_TOKEN" nohup /usr/local/bin/run_cloudflared.sh > /dev/null 2>&1 &
-          sleep 8
 
           echo "📋 آخرین لاگ‌های cloudflared:"
-          tail -n 25 /tmp/cf_tunnel.log || true
+          sudo journalctl -u cloudflared --no-pager -n 15
 
-          if pgrep -x "cloudflared" > /dev/null 2>&1; then
-            echo "✅ Cloudflare Tunnel با پروتکل HTTP/2 با موفقیت اجرا شد."
+          if sudo systemctl is-active --quiet cloudflared && [ "$CF_CONNECTED" -eq 1 ]; then
+            echo "✅ Cloudflare Tunnel با موفقیت به Edge کلودفلر متصل شد."
           else
-            echo "❌ خطا در استارت اولیه کلودفلرد (باینری cloudflared متوقف شد یا کرش کرد)!"
+            echo "❌ خطا در اتصال Cloudflare Tunnel!"
             exit 1
           fi
 
@@ -620,10 +695,11 @@ jobs:
           echo "║    ✅ Dual Language Keyboard (English + Persian)         ║"
           echo "║    ✅ Toggle Shortcut: Alt + Shift                       ║"
           echo "║    ✅ Google Chrome Official (QUIC Disabled for Gemini)  ║"
+          echo "║    ✅ Systemd Managed Services (Xray + ttyd + CF Tunnel) ║"
           echo "║    ✅ WS Heartbeat (20s) + 0-RTT EarlyData (ed=2048)     ║"
           echo "║    ✅ 4GB Safe Shared RAM (shm) + Host IPC Mode          ║"
           echo "║    ✅ BBR + MTU Probing + QUIC Blocked in Xray          ║"
-          echo "║    ✅ Instant Cache Save on Manual Cancel (Trap Signal)  ║"
+          echo "║    ✅ Safe Conditional Cache Save on Manual Cancel       ║"
           echo "╠══════════════════════════════════════════════════════════╣"
           echo "║  🚀 VLESS Connection Link:                              ║"
           echo "╚══════════════════════════════════════════════════════════╝"
@@ -634,17 +710,21 @@ jobs:
           echo "=================================================="
 
           # شکار سیگنال Cancel گیت‌هاب برای خروج فوری و اجرای مرحله ذخیره کش کوکی‌ها
-          trap 'echo "⚠️ سیگنال توقف دریافت شد! خروج فوری برای ذخیره امن کوکی‌ها..."; exit 0' SIGINT SIGTERM
+          SLEEP_PID=""
+          trap 'echo "⚠️ سیگنال توقف دریافت شد! خروج فوری برای ذخیره امن کوکی‌ها..."; [ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null || true; exit 0' SIGINT SIGTERM
 
           # ۳۴۵ دقیقه (۵ ساعت و ۴۵ دقیقه) جهت تضمین اجرای کامل مراحل ۷ و ۸ قبل از سقف ۳۶۰ دقیقه‌ای گیت‌هاب
           for i in $(seq 1 345); do
             sleep 60 &
-            wait $!
+            SLEEP_PID=$!
+            wait "$SLEEP_PID"
             if [ $((i % 10)) -eq 0 ]; then
               CF_UP=$(pgrep -c -x "cloudflared" 2>/dev/null || echo "0")
-              XRAY_UP=$(pgrep -c -f "xray" 2>/dev/null || echo "0")
+              XRAY_UP=$(pgrep -c -x "xray" 2>/dev/null || echo "0")
+              NGINX_UP=$(pgrep -c -x "nginx" 2>/dev/null || echo "0")
+              TTYD_UP=$(pgrep -c -x "ttyd" 2>/dev/null || echo "0")
               KASM_UP=$(sudo docker inspect -f '{{.State.Running}}' kasm-chrome 2>/dev/null || echo "false")
-              echo "[$i/345] 📊 Status: Proto=HTTP/2 | CF=$CF_UP | Xray=$XRAY_UP | Kasm=$KASM_UP"
+              echo "[$i/345] 📊 Status: CF=$CF_UP | Xray=$XRAY_UP | Nginx=$NGINX_UP | ttyd=$TTYD_UP | Kasm=$KASM_UP"
             else
               echo "[$i/345] 🟢 Running on $PRX_DOMAIN (HTTP/2 Stable)"
             fi
@@ -653,11 +733,11 @@ jobs:
 
       # === ۷. متوقف کردن ایمن کانتینر برای ذخیره نهایی کوکی‌ها و پاکسازی کش‌های حجیم و موقت ===
       - name: 7. Gracefully Stop Browser & Clean Sockets
-        if: always()
+        if: always() && steps.setup_desktop.outcome == 'success'
         run: |
           echo "⏹️ متوقف کردن ایمن کانتینر برای ثبت نهایی کوکی‌ها..."
           sudo docker stop kasm-chrome -t 10 2>/dev/null || true
-          
+
           # حذف فایل‌های موقت، قفل‌ها، سوکت‌ها و کش‌های حجیم کروم (با حفظ کامل کوکی‌ها، پسوردها و افزونه‌ها)
           sudo rm -rf /home/runner/kasm_data/.cache \
                       /home/runner/kasm_data/Singleton* \
@@ -669,15 +749,15 @@ jobs:
                       /home/runner/kasm_data/.config/google-chrome/ShaderCache \
                       /home/runner/kasm_data/.X11-unix \
                       /home/runner/kasm_data/tmp 2>/dev/null || true
-          
-          # آزادسازی دسترسی کامل جهت ساخت آرشیو کش
+
+          # آزادسازی دسترسی ایمن برای کاربر runner جهت ساخت آرشیو کش بدون خراب کردن پرمیشن‌ها
           sudo chown -R runner:docker /home/runner/kasm_data
-          sudo chmod -R 777 /home/runner/kasm_data
-          echo "✅ داده‌های پروفایل با موفقیت فشرده و آماده ذخیره‌سازی شدند."
+          sudo chmod -R u+rwX /home/runner/kasm_data
+          echo "✅ داده‌های پروفایل با موفقیت پاکسازی و آماده ذخیره‌سازی شدند."
 
       # === ۸. ذخیره‌سازی آرشیو سشن‌ها و کوکی‌ها در گیت‌هاب ===
       - name: 8. Save Persistent Browser Profile & Cookies
-        if: always()
+        if: always() && steps.setup_desktop.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: /home/runner/kasm_data
