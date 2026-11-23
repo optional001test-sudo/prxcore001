@@ -57,8 +57,8 @@ jobs:
           echo "PRX_UUID=$CLEAN_UUID" >> "$GITHUB_ENV"
           echo "✅ تمام سکرت‌ها تأیید شدند (دامنه: $CLEAN_DOMAIN)."
 
-          # --- ذخیره DNS پیش‌فرض رانر پیش از تغییر (برای بازیابی خودکار در صورت محدودیت پورت 53) ---
-          ORIG_DNS=$(grep -h -E '^nameserver ' /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null | awk '{print $2}' | grep -v '^127\.' | sort -u | head -n 2)
+          # --- ذخیره امن DNS پیش‌فرض رانر (ایمن در برابر pipefail) ---
+          ORIG_DNS=$( (grep -h -E '^nameserver ' /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null | awk '{print $2}' | grep -v '^127\.' | sort -u | head -n 2) || true )
 
           # --- تثبیت DNS بدون چرخش با تست سلامت فوری ---
           sudo systemctl stop systemd-resolved 2>/dev/null || true
@@ -79,7 +79,8 @@ jobs:
               sudo ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
             fi
           fi
-          echo "✅ DNS سیستم تأیید شد ($(grep '^nameserver' /etc/resolv.conf | tr '\n' ' '))."
+          ACTIVE_DNS=$( (grep '^nameserver' /etc/resolv.conf | tr '\n' ' ') || true )
+          echo "✅ DNS سیستم تأیید شد ($ACTIVE_DNS)."
 
           # --- فعال‌سازی ماژول BBR در هسته لینوکس ---
           sudo modprobe tcp_bbr 2>/dev/null || true
@@ -150,7 +151,7 @@ jobs:
 
           echo "✅ تنظیمات کرنل، BBR، بافر QUIC، MTU Probing و TCP MSS Clamping اعمال شدند."
 
-      # === ۲الف. ایجاد کاربر امن و نصب سریع پیش‌نیازها (ایزوله از مخازن مزاحم شخص ثالث) ===
+      # === ۲الف. ایجاد کاربر امن و نصب سریع پیش‌نیازها (ایزوله و دارای Fallback واقعی میرور) ===
       - name: 2a. Setup Secure User & Core Dependencies
         run: |
           echo "⏳ [1/5] ساخت کاربر امن prxcore..."
@@ -162,40 +163,48 @@ jobs:
           sudo mkdir -p /home/prxcore/.config/tmux
           sudo chown -R prxcore:prxcore /home/prxcore
 
-          echo "⏳ [2/5] انتخاب خودکار سریع‌ترین میرور اوبونتو و نصب پکیج‌های ناموجود..."
-          CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
-          FAST_MIRROR=""
-          for m in \
-            "http://mirrors.edge.kernel.org/ubuntu" \
-            "http://azure.archive.ubuntu.com/ubuntu" \
-            "http://us.archive.ubuntu.com/ubuntu" \
-            "http://archive.ubuntu.com/ubuntu"; do
-            if curl -4 -fsSI --connect-timeout 4 --max-time 6 "${m}/dists/${CODENAME}/Release" >/dev/null 2>&1; then
-              FAST_MIRROR="$m"
-              break
-            fi
-          done
-          FAST_MIRROR="${FAST_MIRROR:-http://archive.ubuntu.com/ubuntu}"
-          echo "✅ میرور فعال انتخاب‌شده: $FAST_MIRROR ($CODENAME)"
-
-          # ساخت فایل مخزن ایزوله فقط برای اوبونتو (نادیده گرفتن ۱۵+ مخزن شخص ثالث کند/خراب در sources.list.d)
-          cat <<EOF | sudo tee /tmp/prx-ubuntu.list > /dev/null
-          deb $FAST_MIRROR $CODENAME main universe
-          deb $FAST_MIRROR ${CODENAME}-updates main universe
-          deb $FAST_MIRROR ${CODENAME}-security main universe
-          EOF
-
+          echo "⏳ [2/5] بررسی پکیج‌های پایه و نصب موارد ناموجود با Fallback خودکار میرور..."
           NEEDED_PKGS=""
           for pkg in htop tmux curl wget unzip nginx jq; do
-            if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+            PKG_STATUS=$(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null || true)
+            if [ "$PKG_STATUS" != "install ok installed" ]; then
               NEEDED_PKGS="$NEEDED_PKGS $pkg"
             fi
           done
 
           if [ -n "$NEEDED_PKGS" ]; then
             echo "📦 پکیج‌های نیازمند نصب:$NEEDED_PKGS"
-            APT_OPTS="-o Dir::Etc::sourcelist=/tmp/prx-ubuntu.list -o Dir::Etc::sourceparts=- -o Acquire::Retries=3 -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
-            sudo timeout 60 apt-get $APT_OPTS update
+            CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+            APT_OPTS="-o Dir::Etc::sourcelist=/tmp/prx-ubuntu.list -o Dir::Etc::sourceparts=- -o Acquire::Retries=2 -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+            APT_UPDATED=0
+
+            for m in \
+              "http://mirrors.edge.kernel.org/ubuntu" \
+              "http://azure.archive.ubuntu.com/ubuntu" \
+              "http://us.archive.ubuntu.com/ubuntu" \
+              "http://archive.ubuntu.com/ubuntu"; do
+              if ! curl -4 -fsSI --connect-timeout 4 --max-time 6 "${m}/dists/${CODENAME}/Release" >/dev/null 2>&1; then
+                continue
+              fi
+              cat <<EOF | sudo tee /tmp/prx-ubuntu.list > /dev/null
+          deb $m $CODENAME main universe
+          deb $m ${CODENAME}-updates main universe
+          deb $m ${CODENAME}-security main universe
+          EOF
+              echo "🔄 تست و به‌روزرسانی لیست پکیج از $m ..."
+              if sudo timeout 60 apt-get $APT_OPTS update; then
+                APT_UPDATED=1
+                echo "✅ میرور فعال تأیید شد: $m ($CODENAME)"
+                break
+              fi
+              echo "⚠️ خطا در همگام‌سازی با $m؛ امتحان میرور بعدی..."
+            done
+
+            if [ "$APT_UPDATED" -ne 1 ]; then
+              echo "❌ خطا: هیچ‌یک از میرورهای اوبونتو پاسخ معتبر ندادند."
+              exit 1
+            fi
+
             sudo DEBIAN_FRONTEND=noninteractive timeout 120 apt-get $APT_OPTS install -y -q $NEEDED_PKGS
           else
             echo "✅ تمام پکیج‌های پایه از قبل روی رانر نصب هستند."
@@ -219,7 +228,7 @@ jobs:
           sudo chmod +x /usr/local/bin/cloudflared
 
           echo "⏳ [5/5] تشخیص موقعیت جغرافیایی رانر..."
-          RUNNER_INFO=$(curl -4 -s --connect-timeout 5 --max-time 8 https://ipinfo.io/json || echo '{}')
+          RUNNER_INFO=$(curl -4 -s --connect-timeout 5 --max-time 8 https://ipinfo.io/json 2>/dev/null || echo '{}')
           RUNNER_LOC=$(echo "$RUNNER_INFO" | jq -r '"\(.city // "Unknown"), \(.region // "Unknown") (\(.org // "Unknown"))"' 2>/dev/null || echo "Unknown")
           echo "RUNNER_LOC=$RUNNER_LOC" >> "$GITHUB_ENV"
           echo "🌍 Runner Location: $RUNNER_LOC"
@@ -325,12 +334,12 @@ jobs:
             rm -rf /var/lib/apt/lists/*
           '
 
-          # تشخیص خودکار DISPLAY، اعمال نقشه کیبورد و اجرای قطعی کروم (بدون باگ خودتطبیقی pgrep)
+          # تشخیص خودکار DISPLAY، اعمال نقشه کیبورد و اجرای قطعی کروم (رفع کامل باگ خودتطبیقی pgrep)
           sudo docker exec -u 1000 -e HOME=/config -e CHROME_FLAGS="$CHROME_FLAGS" kasm-chrome bash -c '
             DISP=$(ls /tmp/.X11-unix 2>/dev/null | sed "s/^X/:/" | head -n 1)
             export DISPLAY="${DISP:-:1}"
             setxkbmap -layout "us,ir" -option "grp:alt_shift_toggle" 2>/dev/null || true
-            if ! pgrep -f "/opt/google/chrome/chrome" >/dev/null 2>&1; then
+            if ! pgrep -f "/opt/google/chrome/[c]hrome" >/dev/null 2>&1; then
               nohup /usr/bin/google-chrome-stable $CHROME_FLAGS </dev/null >/dev/null 2>&1 &
             fi
           ' 2>/dev/null || true
@@ -789,11 +798,11 @@ jobs:
             exit 1
           fi
 
-          # انتظار هوشمند تا ثبت واقعی اتصال تانل در Edge کلودفلر (حداکثر ۴۰ ثانیه)
+          # انتظار هوشمند تا ثبت واقعی اتصال تانل در Edge کلودفلر (ایمن در برابر SIGPIPE)
           echo "⏳ در حال بررسی اتصال تانل به سرورهای Edge کلودفلر..."
           CF_CONNECTED=0
           for i in {1..20}; do
-            if sudo journalctl -u cloudflared --no-pager | grep -q "Registered tunnel connection"; then
+            if sudo journalctl -u cloudflared --no-pager | grep -F "Registered tunnel connection" >/dev/null; then
               CF_CONNECTED=1
               break
             fi
@@ -808,7 +817,8 @@ jobs:
             exit 1
           fi
 
-          CF_PROTO=$(sudo journalctl -u cloudflared --no-pager | grep "Registered tunnel connection" | tail -n 1 | grep -oE 'protocol=[a-z0-9]+' | cut -d= -f2 || echo "auto")
+          CF_PROTO=$( (sudo journalctl -u cloudflared --no-pager | grep -F "Registered tunnel connection" | tail -n 1 | grep -oE 'protocol=[a-z0-9]+' | cut -d= -f2) || true )
+          CF_PROTO="${CF_PROTO:-auto}"
           echo "✅ Cloudflare Tunnel با موفقیت به Edge کلودفلر متصل شد (پروتکل فعال: $CF_PROTO)."
 
           # تست نهایی End-to-End از طریق دامنه عمومی کلودفلر
@@ -832,7 +842,8 @@ jobs:
         run: |
           VLESS_LINK="vless://$PRX_UUID@$PRX_DOMAIN:443?path=%2Fprx-stream%3Fed%3D2048&security=tls&encryption=none&type=ws&sni=$PRX_DOMAIN&host=$PRX_DOMAIN&fp=chrome&alpn=http%2F1.1#PRX-Ultra"
 
-          CF_PROTO=$(sudo journalctl -u cloudflared --no-pager | grep "Registered tunnel connection" | tail -n 1 | grep -oE 'protocol=[a-z0-9]+' | cut -d= -f2 || echo "auto")
+          CF_PROTO=$( (sudo journalctl -u cloudflared --no-pager | grep -F "Registered tunnel connection" | tail -n 1 | grep -oE 'protocol=[a-z0-9]+' | cut -d= -f2) || true )
+          CF_PROTO="${CF_PROTO:-auto}"
 
           if [ "$ENABLE_DESKTOP" = "true" ]; then
             TARGET_TOTAL_MINUTES=345
@@ -844,7 +855,9 @@ jobs:
 
           DEADLINE_EPOCH=$((JOB_START_EPOCH + TARGET_TOTAL_MINUTES * 60))
           REMAINING_MINS=$(( (DEADLINE_EPOCH - $(date +%s)) / 60 ))
-          [ "$REMAINING_MINS" -lt 1 ] && REMAINING_MINS=1
+          if [ "$REMAINING_MINS" -lt 1 ]; then
+            REMAINING_MINS=1
+          fi
 
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
@@ -866,7 +879,7 @@ jobs:
           echo "║    ✅ Xray Buffer 512KB + AsIs Routing + QUIC Blocked    ║"
           echo "║    ✅ WS Heartbeat (20s) + EarlyData (ed=2048) + ALPN    ║"
           echo "║    ✅ CPU Priority (Nice=-10) for Xray, Nginx & CF       ║"
-          echo "║    ✅ Isolated Fast-Mirror APT + DNS Auto-Fallback       ║"
+          echo "║    ✅ Resilient APT Fallback + DNS Auto-Fallback         ║"
           echo "╠══════════════════════════════════════════════════════════╣"
           echo "║  🚀 VLESS Connection Link (Set Clean IP in v2rayN):      ║"
           echo "╚══════════════════════════════════════════════════════════╝"
@@ -892,14 +905,29 @@ jobs:
             NGINX_UP=$(pgrep -c -x "nginx" 2>/dev/null || true)
             TTYD_UP=$(pgrep -c -x "ttyd" 2>/dev/null || true)
 
-            [ "${CF_UP:-0}" -eq 0 ] && { echo "🔄 ری‌استارت خودکار cloudflared..."; sudo systemctl restart cloudflared || true; }
-            [ "${XRAY_UP:-0}" -eq 0 ] && { echo "🔄 ری‌استارت خودکار xray..."; sudo systemctl restart xray || true; }
-            [ "${NGINX_UP:-0}" -eq 0 ] && { echo "🔄 ری‌استارت خودکار nginx..."; sudo systemctl restart nginx || true; }
-            [ "${TTYD_UP:-0}" -eq 0 ] && { echo "🔄 ری‌استارت خودکار ttyd..."; sudo systemctl restart ttyd || true; }
+            if [ "${CF_UP:-0}" -eq 0 ]; then
+              echo "🔄 ری‌استارت خودکار cloudflared..."
+              sudo systemctl restart cloudflared || true
+            fi
+            if [ "${XRAY_UP:-0}" -eq 0 ]; then
+              echo "🔄 ری‌استارت خودکار xray..."
+              sudo systemctl restart xray || true
+            fi
+            if [ "${NGINX_UP:-0}" -eq 0 ]; then
+              echo "🔄 ری‌استارت خودکار nginx..."
+              sudo systemctl restart nginx || true
+            fi
+            if [ "${TTYD_UP:-0}" -eq 0 ]; then
+              echo "🔄 ری‌استارت خودکار ttyd..."
+              sudo systemctl restart ttyd || true
+            fi
 
             if [ "$ENABLE_DESKTOP" = "true" ]; then
               KASM_UP=$(sudo docker inspect -f '{{.State.Running}}' kasm-chrome 2>/dev/null || echo "false")
-              [ "$KASM_UP" != "true" ] && { echo "🔄 ری‌استارت خودکار kasm-chrome..."; sudo docker start kasm-chrome || true; }
+              if [ "$KASM_UP" != "true" ]; then
+                echo "🔄 ری‌استارت خودکار kasm-chrome..."
+                sudo docker start kasm-chrome || true
+              fi
             else
               KASM_UP="OFF"
             fi
@@ -913,14 +941,14 @@ jobs:
           done
           echo "⏰ زمان کاری به پایان رسید."
 
-      # === ۷. بستن ایمن کروم و توقف کانتینر برای ذخیره نهایی کوکی‌ها (فقط در حالت دسکتاپ) ===
+      # === ۷. بستن ایمن کروم، آزادسازی مالکیت و پاکسازی واقعی کش‌های حجیم (فقط در حالت دسکتاپ) ===
       - name: 7. Gracefully Stop Browser & Clean Sockets
         if: always() && inputs.enable_desktop && steps.setup_desktop.outcome == 'success'
         run: |
           echo "⏹️ ارسال سیگنال خروج امن به Google Chrome برای ثبت کامل کوکی‌ها..."
-          sudo docker exec kasm-chrome pkill -TERM -f "/opt/google/chrome/chrome" 2>/dev/null || true
+          sudo docker exec kasm-chrome pkill -TERM -f "/opt/google/chrome/[c]hrome" 2>/dev/null || true
           for i in {1..10}; do
-            if ! sudo docker exec kasm-chrome pgrep -f "/opt/google/chrome/chrome" >/dev/null 2>&1; then
+            if ! sudo docker exec kasm-chrome pgrep -f "/opt/google/chrome/[c]hrome" >/dev/null 2>&1; then
               break
             fi
             sleep 1
@@ -928,6 +956,10 @@ jobs:
 
           echo "⏹️ متوقف کردن ایمن کانتینر برای ثبت نهایی کوکی‌ها..."
           sudo docker stop kasm-chrome -t 15 2>/dev/null || true
+
+          # آزادسازی مالکیت پیش از پاکسازی تا الگوی * روی پوشه‌های کروم توسط کاربر runner باز شود
+          sudo chown -R runner:docker /home/runner/kasm_data
+          sudo chmod -R u+rwX /home/runner/kasm_data
 
           sudo rm -rf \
             /home/runner/kasm_data/.cache \
@@ -944,9 +976,8 @@ jobs:
             /home/runner/kasm_data/.X11-unix \
             /home/runner/kasm_data/tmp 2>/dev/null || true
 
-          sudo chown -R runner:docker /home/runner/kasm_data
-          sudo chmod -R u+rwX /home/runner/kasm_data
-          echo "✅ داده‌های پروفایل با موفقیت پاکسازی و آماده ذخیره‌سازی شدند."
+          PROFILE_SIZE=$(du -sh /home/runner/kasm_data 2>/dev/null | cut -f1 || echo "unknown")
+          echo "✅ داده‌های پروفایل پاکسازی و آماده ذخیره‌سازی شدند (حجم نهایی آرشیو: $PROFILE_SIZE)."
 
       # === ۸. ذخیره‌سازی آرشیو سشن‌ها و کوکی‌ها در گیت‌هاب (فقط در حالت دسکتاپ) ===
       - name: 8. Save Persistent Browser Profile & Cookies
