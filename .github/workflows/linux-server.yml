@@ -40,10 +40,9 @@ jobs:
           restore-keys: |
             kasm-profile-
 
-      # === ۱. اعتبارسنجی سکرت‌ها و بهینه‌سازی کرنل برای کمترین پینگ و بیشترین سرعت ===
+      # === ۱. اعتبارسنجی سکرت‌ها، تنظیم DNS با بازگشت خودکار و بهینه‌سازی کرنل ===
       - name: 1. Validate Secrets & Deep Kernel Network Tuning (BBR + Low-Jitter DNS + MSS Clamping)
         run: |
-          # ثبت زمان دقیق شروع جاب برای حفظ حاشیه امن پیش از سقف ۳۶۰ دقیقه‌ای گیت‌هاب
           echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
 
           # --- اعتبارسنجی و پاکسازی سکرت‌ها ---
@@ -58,11 +57,29 @@ jobs:
           echo "PRX_UUID=$CLEAN_UUID" >> "$GITHUB_ENV"
           echo "✅ تمام سکرت‌ها تأیید شدند (دامنه: $CLEAN_DOMAIN)."
 
-          # --- تثبیت DNS بدون چرخش (حذف rotate و 9.9.9.9 برای حذف نوسان پینگ DNS) ---
+          # --- ذخیره DNS پیش‌فرض رانر پیش از تغییر (برای بازیابی خودکار در صورت محدودیت پورت 53) ---
+          ORIG_DNS=$(grep -E '^nameserver ' /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null | awk '{print $2}' | grep -v '^127\.' | sort -u | head -n 2)
+
+          # --- تثبیت DNS بدون چرخش با تست سلامت فوری ---
           sudo systemctl stop systemd-resolved 2>/dev/null || true
           sudo systemctl disable systemd-resolved 2>/dev/null || true
           sudo rm -f /etc/resolv.conf
           printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions edns0 timeout:2 attempts:3\n" | sudo tee /etc/resolv.conf > /dev/null
+
+          if ! timeout 5 getent ahostsv4 github.com >/dev/null 2>&1; then
+            echo "⚠️ DNS خارجی (1.1.1.1) در این رانر پاسخ نداد؛ بازگشت خودکار به DNS داخلی رانر..."
+            if [ -n "$ORIG_DNS" ]; then
+              : | sudo tee /etc/resolv.conf > /dev/null
+              for ns in $ORIG_DNS; do
+                echo "nameserver $ns" | sudo tee -a /etc/resolv.conf > /dev/null
+              done
+              printf "options timeout:2 attempts:3\n" | sudo tee -a /etc/resolv.conf > /dev/null
+            else
+              sudo systemctl enable --now systemd-resolved 2>/dev/null || true
+              sudo ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+            fi
+          fi
+          echo "✅ DNS سیستم تأیید شد ($(grep '^nameserver' /etc/resolv.conf | tr '\n' ' '))."
 
           # --- فعال‌سازی ماژول BBR در هسته لینوکس ---
           sudo modprobe tcp_bbr 2>/dev/null || true
@@ -131,9 +148,9 @@ jobs:
           # --- تنظیم خودکار سایز پکت‌ها (TCP MSS Clamping یکپارچه برای هاست و داکر) ---
           sudo iptables -t mangle -A POSTROUTING ! -o lo -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 
-          echo "✅ تنظیمات کرنل، DNS کم‌جیتر، BBR، بافر QUIC، MTU Probing و TCP MSS Clamping اعمال شدند."
+          echo "✅ تنظیمات کرنل، BBR، بافر QUIC، MTU Probing و TCP MSS Clamping اعمال شدند."
 
-      # === ۲الف. ایجاد کاربر امن و نصب پیش‌نیازهای هسته (ضدقفل، دارای تایم‌اوت قطعی و لاگ شفاف) ===
+      # === ۲الف. ایجاد کاربر امن و نصب سریع پیش‌نیازها (ایزوله از مخازن مزاحم شخص ثالث) ===
       - name: 2a. Setup Secure User & Core Dependencies
         run: |
           echo "⏳ [1/5] ساخت کاربر امن prxcore..."
@@ -145,41 +162,59 @@ jobs:
           sudo mkdir -p /home/prxcore/.config/tmux
           sudo chown -R prxcore:prxcore /home/prxcore
 
-          echo "⏳ [2/5] تنظیم میرور سریع us.archive.ubuntu.com و نصب پکیج‌ها..."
-          if [ -f /etc/apt/apt-mirrors.txt ]; then
-            sudo tee /etc/apt/apt-mirrors.txt > /dev/null <<'MIRRORS'
-          http://us.archive.ubuntu.com/ubuntu/
-          http://mirrors.edge.kernel.org/ubuntu/
-          http://archive.ubuntu.com/ubuntu/
-          MIRRORS
+          echo "⏳ [2/5] انتخاب خودکار سریع‌ترین میرور اوبونتو و نصب پکیج‌های ناموجود..."
+          CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          FAST_MIRROR=""
+          for m in \
+            "http://mirrors.edge.kernel.org/ubuntu" \
+            "http://azure.archive.ubuntu.com/ubuntu" \
+            "http://us.archive.ubuntu.com/ubuntu" \
+            "http://archive.ubuntu.com/ubuntu"; do
+            if curl -4 -fsSI --connect-timeout 4 --max-time 6 "${m}/dists/${CODENAME}/Release" >/dev/null 2>&1; then
+              FAST_MIRROR="$m"
+              break
+            fi
+          done
+          FAST_MIRROR="${FAST_MIRROR:-http://archive.ubuntu.com/ubuntu}"
+          echo "✅ میرور فعال انتخاب‌شده: $FAST_MIRROR ($CODENAME)"
+
+          # ساخت فایل مخزن ایزوله فقط برای اوبونتو (نادیده گرفتن ۱۵+ مخزن شخص ثالث کند/خراب در sources.list.d)
+          cat <<EOF | sudo tee /tmp/prx-ubuntu.list > /dev/null
+          deb $FAST_MIRROR $CODENAME main universe
+          deb $FAST_MIRROR ${CODENAME}-updates main universe
+          deb $FAST_MIRROR ${CODENAME}-security main universe
+          EOF
+
+          NEEDED_PKGS=""
+          for pkg in htop tmux curl wget unzip nginx jq; do
+            if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+              NEEDED_PKGS="$NEEDED_PKGS $pkg"
+            fi
+          done
+
+          if [ -n "$NEEDED_PKGS" ]; then
+            echo "📦 پکیج‌های نیازمند نصب:$NEEDED_PKGS"
+            APT_OPTS="-o Dir::Etc::sourcelist=/tmp/prx-ubuntu.list -o Dir::Etc::sourceparts=- -o Acquire::Retries=3 -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+            sudo timeout 60 apt-get $APT_OPTS update
+            sudo DEBIAN_FRONTEND=noninteractive timeout 120 apt-get $APT_OPTS install -y -q $NEEDED_PKGS
+          else
+            echo "✅ تمام پکیج‌های پایه از قبل روی رانر نصب هستند."
           fi
-          sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu/|http://us.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
-          sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors\.txt|http://us.archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
 
-          APT_OPTS="-o Acquire::Retries=3 -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
-          if ! sudo timeout 120 apt-get $APT_OPTS update -qq; then
-            echo "⚠️ میرور اول پاسخ نداد؛ سوئیچ خودکار به archive.ubuntu.com..."
-            sudo sed -i 's|http://us\.archive\.ubuntu\.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
-            sudo timeout 120 apt-get $APT_OPTS update -qq
-          fi
-
-          sudo DEBIAN_FRONTEND=noninteractive timeout 180 apt-get $APT_OPTS install -y -qq \
-            htop tmux curl wget unzip nginx jq
-
-          echo "⏳ [3/5] نصب fastfetch (اختیاری با تایم‌اوت کوتاه)..."
-          if ! sudo DEBIAN_FRONTEND=noninteractive timeout 45 apt-get $APT_OPTS install -y -qq fastfetch 2>/dev/null; then
-            curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 \
+          echo "⏳ [3/5] نصب fastfetch (اختیاری و سریع از گیت‌هاب)..."
+          if ! command -v fastfetch >/dev/null 2>&1; then
+            curl -4 -fsSL --connect-timeout 8 --max-time 20 --retry 2 \
               https://github.com/fastfetch-cli/fastfetch/releases/latest/download/fastfetch-linux-amd64.deb -o /tmp/fastfetch.deb 2>/dev/null && \
               sudo dpkg -i /tmp/fastfetch.deb >/dev/null 2>&1 || true
             rm -f /tmp/fastfetch.deb
           fi
 
           echo "⏳ [4/5] دانلود پایدار ttyd و cloudflared با تایم‌اوت قطعی..."
-          sudo curl -fsSL --connect-timeout 15 --max-time 60 --retry 4 --retry-delay 2 \
+          sudo curl -4 -fsSL --connect-timeout 15 --max-time 60 --retry 4 --retry-delay 2 \
             https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -o /usr/local/bin/ttyd
           sudo chmod +x /usr/local/bin/ttyd
 
-          sudo curl -fsSL --connect-timeout 15 --max-time 60 --retry 4 --retry-delay 2 \
+          sudo curl -4 -fsSL --connect-timeout 15 --max-time 60 --retry 4 --retry-delay 2 \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
           sudo chmod +x /usr/local/bin/cloudflared
 
@@ -188,7 +223,7 @@ jobs:
           RUNNER_LOC=$(echo "$RUNNER_INFO" | jq -r '"\(.city // "Unknown"), \(.region // "Unknown") (\(.org // "Unknown"))"' 2>/dev/null || echo "Unknown")
           echo "RUNNER_LOC=$RUNNER_LOC" >> "$GITHUB_ENV"
           echo "🌍 Runner Location: $RUNNER_LOC"
-          echo "✅ کاربر امن و پیش‌نیازهای اصلی بدون تأخیر نصب شدند."
+          echo "✅ کاربر امن و پیش‌نیازهای اصلی با موفقیت نصب شدند."
 
       # === ۲ب. راه‌اندازی میزکار Webtop XFCE و مرورگر Chrome (فقط در صورت فعال بودن enable_desktop) ===
       - name: 2b. Deploy Extreme Webtop XFCE Desktop & Chrome
@@ -306,14 +341,14 @@ jobs:
       - name: 3. Install & Configure Xray-Core (UDS + VLESS WS Heartbeat + 512KB Buffer)
         run: |
           export TERM=xterm-256color
-          curl -fsSL --connect-timeout 15 --max-time 60 --retry 4 https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/install-xray.sh
+          curl -4 -fsSL --connect-timeout 15 --max-time 60 --retry 4 https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/install-xray.sh
           sed -i 's/tput setaf [0-9]/true/g; s/tput sgr0/true/g' /tmp/install-xray.sh
 
           if ! sudo timeout 120 env TERM=xterm-256color bash /tmp/install-xray.sh install; then
             echo "⚠️ اسکریپت نصب با محدودیت مواجه شد؛ در حال نصب تمیز مستقیم هسته Xray..."
             sudo mkdir -p /usr/local/bin /usr/local/share/xray /usr/local/etc/xray
             rm -rf /tmp/xray_extract && mkdir -p /tmp/xray_extract
-            curl -fsSL --connect-timeout 15 --max-time 60 --retry 4 https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o /tmp/xray.zip
+            curl -4 -fsSL --connect-timeout 15 --max-time 60 --retry 4 https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o /tmp/xray.zip
             unzip -qo /tmp/xray.zip -d /tmp/xray_extract
             sudo install -m 755 /tmp/xray_extract/xray /usr/local/bin/xray
             sudo mv -f /tmp/xray_extract/*.dat /usr/local/share/xray/ 2>/dev/null || true
@@ -795,7 +830,6 @@ jobs:
       # === ۶. تولید لینک بهینه VLESS WS و نگهداری هوشمند سرور با خودترمیمی ===
       - name: 6. Generate Connection Info & Self-Healing Keep Alive
         run: |
-          # لینک VLESS WS با Early Data (ed=2048)، اثر انگشت Chrome و ALPN دقیق HTTP/1.1
           VLESS_LINK="vless://$PRX_UUID@$PRX_DOMAIN:443?path=%2Fprx-stream%3Fed%3D2048&security=tls&encryption=none&type=ws&sni=$PRX_DOMAIN&host=$PRX_DOMAIN&fp=chrome&alpn=http%2F1.1#PRX-Ultra"
 
           CF_PROTO=$(sudo journalctl -u cloudflared --no-pager | grep "Registered tunnel connection" | tail -n 1 | grep -oE 'protocol=[a-z0-9]+' | cut -d= -f2 || echo "auto")
@@ -832,7 +866,7 @@ jobs:
           echo "║    ✅ Xray Buffer 512KB + AsIs Routing + QUIC Blocked    ║"
           echo "║    ✅ WS Heartbeat (20s) + EarlyData (ed=2048) + ALPN    ║"
           echo "║    ✅ CPU Priority (Nice=-10) for Xray, Nginx & CF       ║"
-          echo "║    ✅ Anti-Hang Timeouts + Dynamic Deadline + Watchdog   ║"
+          echo "║    ✅ Isolated Fast-Mirror APT + DNS Auto-Fallback       ║"
           echo "╠══════════════════════════════════════════════════════════╣"
           echo "║  🚀 VLESS Connection Link (Set Clean IP in v2rayN):      ║"
           echo "╚══════════════════════════════════════════════════════════╝"
@@ -858,7 +892,6 @@ jobs:
             NGINX_UP=$(pgrep -c -x "nginx" 2>/dev/null || true)
             TTYD_UP=$(pgrep -c -x "ttyd" 2>/dev/null || true)
 
-            # خودترمیمی فعال در صورت توقف غیرمنتظره سرویس‌ها
             [ "${CF_UP:-0}" -eq 0 ] && { echo "🔄 ری‌استارت خودکار cloudflared..."; sudo systemctl restart cloudflared || true; }
             [ "${XRAY_UP:-0}" -eq 0 ] && { echo "🔄 ری‌استارت خودکار xray..."; sudo systemctl restart xray || true; }
             [ "${NGINX_UP:-0}" -eq 0 ] && { echo "🔄 ری‌استارت خودکار nginx..."; sudo systemctl restart nginx || true; }
@@ -896,7 +929,6 @@ jobs:
           echo "⏹️ متوقف کردن ایمن کانتینر برای ثبت نهایی کوکی‌ها..."
           sudo docker stop kasm-chrome -t 15 2>/dev/null || true
 
-          # حذف فایل‌های موقت، قفل‌ها، سوکت‌ها و کش‌های حجیم کروم
           sudo rm -rf \
             /home/runner/kasm_data/.cache \
             /home/runner/kasm_data/Singleton* \
