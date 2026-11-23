@@ -1,10 +1,10 @@
-name: prxcore Beast Workstation & Ultra Low-Latency Remote Browser (Webtop XFCE + Xray)
+name: prxcore Beast Workstation & Ultra Low-Latency Remote Browser (Webtop XFCE + Xray XHTTP)
 
 on:
   workflow_dispatch:
     inputs:
       enable_desktop:
-        description: 'فعال‌سازی ریموت دسکتاپ XFCE و مرورگر Chrome (در حالت خاموش فقط پروکسی و وب‌ترمینال با حداکثر سرعت اجرا می‌شوند)'
+        description: 'فعال‌سازی ریموت دسکتاپ XFCE و مرورگر Chrome (در حالت خاموش فقط پروکسی XHTTP و وب‌ترمینال با حداکثر سرعت اجرا می‌شوند)'
         required: false
         type: boolean
         default: false
@@ -346,8 +346,8 @@ jobs:
 
           echo "✅ میزکار XFCE همراه با Google Chrome و کیبورد فارسی مستقر شدند."
 
-      # === ۳. نصب و پیکربندی Xray-Core روی Unix Domain Socket با اولویت بالای CPU ===
-      - name: 3. Install & Configure Xray-Core (UDS + VLESS WS Heartbeat + 512KB Buffer)
+      # === ۳. نصب و پیکربندی Xray-Core با پروتکل XHTTP (SplitHTTP) روی Unix Domain Socket ===
+      - name: 3. Install & Configure Xray-Core (UDS + VLESS XHTTP / SplitHTTP + 512KB Buffer)
         run: |
           export TERM=xterm-256color
           curl -4 -fsSL --connect-timeout 15 --max-time 60 --retry 4 https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/install-xray.sh
@@ -426,10 +426,10 @@ jobs:
                   "decryption": "none"
                 },
                 "streamSettings": {
-                  "network": "ws",
-                  "wsSettings": {
-                    "path": "/prx-stream",
-                    "heartbeatPeriod": 20
+                  "network": "xhttp",
+                  "xhttpSettings": {
+                    "path": "/prx-xhttp",
+                    "mode": "auto"
                   }
                 },
                 "sniffing": {
@@ -512,16 +512,18 @@ jobs:
           sudo systemctl restart xray
           sleep 2
 
+          XRAY_VER=$( (/usr/local/bin/xray version | head -n 1) || true )
+          XRAY_VER="${XRAY_VER:-Xray}"
           if sudo systemctl is-active --quiet xray && [ -S /dev/shm/xray.sock ]; then
-            echo "✅ Xray روی Unix Domain Socket (/dev/shm/xray.sock) با بافر 512KB و اولویت CPU اجرا شد."
+            echo "✅ $XRAY_VER با XHTTP روی Unix Domain Socket (/dev/shm/xray.sock) و بافر 512KB اجرا شد."
           else
             echo "❌ خطا در اجرای Xray یا ایجاد سوکت یونیکس:"
             sudo journalctl -u xray --no-pager -n 25
             exit 1
           fi
 
-      # === ۴. پیکربندی Nginx مالتی‌پلکسر متصل به سوکت یونیکس Xray ===
-      - name: 4. Configure Nginx Ultra Multiplexer (Unix Socket + Exact WS Match)
+      # === ۴. پیکربندی Nginx مالتی‌پلکسر (بهینه‌شده برای XHTTP روی سوکت یونیکس + Keepalive واقعی) ===
+      - name: 4. Configure Nginx Ultra Multiplexer (Unix Socket + XHTTP Streaming)
         run: |
           cat <<'MAIN' | sudo tee /etc/nginx/nginx.conf > /dev/null
           user www-data;
@@ -569,6 +571,9 @@ jobs:
           cat <<'SITE_HEAD' | sudo tee /etc/nginx/sites-available/default > /dev/null
           upstream xray_backend {
               server unix:/dev/shm/xray.sock;
+              keepalive 256;
+              keepalive_timeout 120s;
+              keepalive_requests 100000;
           }
 
           upstream ttyd_backend {
@@ -594,23 +599,19 @@ jobs:
               server_name _;
               client_max_body_size 0;
 
-              # === ۱. مسیر دقیق پروکسی VLESS WS روی Unix Domain Socket ===
-              location = /prx-stream {
-                  if ($http_upgrade !~* "websocket") {
-                      return 404;
-                  }
+              # === ۱. مسیر پروکسی VLESS XHTTP (SplitHTTP) — Prefix Match الزامی برای زیرمسیرهای packet-up ===
+              location ^~ /prx-xhttp {
                   access_log off;
                   proxy_redirect off;
                   proxy_pass http://xray_backend;
                   proxy_http_version 1.1;
-                  proxy_set_header Upgrade $http_upgrade;
-                  proxy_set_header Connection $connection_upgrade;
-                  proxy_set_header Sec-WebSocket-Protocol $http_sec_websocket_protocol;
+                  proxy_set_header Connection "";
                   proxy_set_header Host $host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
                   proxy_set_header X-Forwarded-Proto $forwarded_proto;
 
+                  chunked_transfer_encoding on;
                   proxy_buffering off;
                   proxy_request_buffering off;
                   proxy_cache off;
@@ -683,7 +684,7 @@ jobs:
               location = /health {
                   access_log off;
                   default_type application/json;
-                  return 200 '{"status":"ok","transport":"ws","timestamp":"$time_iso8601"}';
+                  return 200 '{"status":"ok","transport":"xhttp","timestamp":"$time_iso8601"}';
               }
           }
           SITE_TAIL
@@ -703,7 +704,7 @@ jobs:
           sudo nginx -t
           sudo systemctl restart nginx
           curl -sf http://127.0.0.1:8000/health > /dev/null
-          echo "✅ Nginx مالتی‌پلکسر با اتصال مستقیم Unix Socket و اولویت CPU اجرا شد."
+          echo "✅ Nginx مالتی‌پلکسر (XHTTP + UDS Keepalive + اولویت CPU) اجرا شد."
 
       # === ۵. راه‌اندازی وب‌ترمینال و Cloudflare Tunnel (پروتکل خودکار QUIC/HTTP2) ===
       - name: 5. Launch Services & Cloudflare Tunnel (Auto QUIC/HTTP2 + High Priority)
@@ -837,20 +838,21 @@ jobs:
             echo "⚠️ هشدار: پاسخ تست عمومی HTTP $EXT_CODE بود."
           fi
 
-      # === ۶. تولید لینک بهینه VLESS WS و نگهداری هوشمند سرور با خودترمیمی ===
+      # === ۶. تولید لینک بهینه VLESS XHTTP و نگهداری هوشمند سرور با خودترمیمی ===
       - name: 6. Generate Connection Info & Self-Healing Keep Alive
         run: |
-          VLESS_LINK="vless://$PRX_UUID@$PRX_DOMAIN:443?path=%2Fprx-stream%3Fed%3D2048&security=tls&encryption=none&type=ws&sni=$PRX_DOMAIN&host=$PRX_DOMAIN&fp=chrome&alpn=http%2F1.1#PRX-Ultra"
+          # لینک VLESS XHTTP (SplitHTTP) با حالت packet-up (ضد QoS و کاملاً سازگار با Cloudflare CDN) و ALPN HTTP/2
+          VLESS_LINK="vless://$PRX_UUID@$PRX_DOMAIN:443?encryption=none&security=tls&sni=$PRX_DOMAIN&fp=chrome&alpn=h2&type=xhttp&host=$PRX_DOMAIN&path=%2Fprx-xhttp&mode=packet-up#PRX-XHTTP"
 
           CF_PROTO=$( (sudo journalctl -u cloudflared --no-pager | grep -F "Registered tunnel connection" | tail -n 1 | grep -oE 'protocol=[a-z0-9]+' | cut -d= -f2) || true )
           CF_PROTO="${CF_PROTO:-auto}"
 
           if [ "$ENABLE_DESKTOP" = "true" ]; then
             TARGET_TOTAL_MINUTES=345
-            MODE_LABEL="Full Desktop + Ultra Proxy"
+            MODE_LABEL="Full Desktop + Ultra XHTTP Proxy"
           else
             TARGET_TOTAL_MINUTES=355
-            MODE_LABEL="Proxy-Only Ultra Low-Latency Mode"
+            MODE_LABEL="Proxy-Only Ultra Low-Latency XHTTP Mode"
           fi
 
           DEADLINE_EPOCH=$((JOB_START_EPOCH + TARGET_TOTAL_MINUTES * 60))
@@ -861,7 +863,7 @@ jobs:
 
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║   🎉 ULTRA LOW-LATENCY PROXY & WORKSTATION ACTIVE!       ║"
+          echo "║   🎉 ULTRA LOW-LATENCY XHTTP PROXY & WORKSTATION ACTIVE! ║"
           echo "╠══════════════════════════════════════════════════════════╣"
           printf "║  🧭 Active Mode:             %s\n" "$MODE_LABEL"
           printf "║  🌍 Runner Location:         %s\n" "${RUNNER_LOC:-Unknown}"
@@ -873,15 +875,15 @@ jobs:
           echo "║  🔐 Login Username:          prxcore                     ║"
           echo "║  🔐 Password:                [Defined in PRX_USER_PASS]  ║"
           echo "╠══════════════════════════════════════════════════════════╣"
-          echo "║  ⚡ Proxy Ultra Optimizations Active:                    ║"
-          echo "║    ✅ Unix Domain Socket (/dev/shm/xray.sock)            ║"
+          echo "║  ⚡ XHTTP (SplitHTTP) Optimizations Active:              ║"
+          echo "║    ✅ Transport: XHTTP (mode=packet-up, alpn=h2)         ║"
+          echo "║    ✅ Unix Domain Socket (/dev/shm/xray.sock + Keepalive)║"
           echo "║    ✅ CF Tunnel Auto Protocol (QUIC First, No HoL Block) ║"
           echo "║    ✅ Xray Buffer 512KB + AsIs Routing + QUIC Blocked    ║"
-          echo "║    ✅ WS Heartbeat (20s) + EarlyData (ed=2048) + ALPN    ║"
           echo "║    ✅ CPU Priority (Nice=-10) for Xray, Nginx & CF       ║"
           echo "║    ✅ Resilient APT Fallback + DNS Auto-Fallback         ║"
           echo "╠══════════════════════════════════════════════════════════╣"
-          echo "║  🚀 VLESS Connection Link (Set Clean IP in v2rayN):      ║"
+          echo "║  🚀 VLESS XHTTP Link (Set Clean IP in v2rayN):           ║"
           echo "╚══════════════════════════════════════════════════════════╝"
           echo ""
           echo "$VLESS_LINK"
@@ -936,7 +938,7 @@ jobs:
               LEFT_MINS=$(( (DEADLINE_EPOCH - $(date +%s)) / 60 ))
               echo "[+${MINUTE}m | -${LEFT_MINS}m] 📊 Status: CF=${CF_UP:-0} ($CF_PROTO) | Xray=${XRAY_UP:-0} | Nginx=${NGINX_UP:-0} | ttyd=${TTYD_UP:-0} | Kasm=$KASM_UP"
             else
-              echo "[+${MINUTE}m] 🟢 Running on $PRX_DOMAIN ($CF_PROTO)"
+              echo "[+${MINUTE}m] 🟢 Running XHTTP on $PRX_DOMAIN ($CF_PROTO)"
             fi
           done
           echo "⏰ زمان کاری به پایان رسید."
