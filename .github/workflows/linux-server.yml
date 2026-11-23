@@ -58,7 +58,7 @@ jobs:
           echo "✅ تمام سکرت‌ها تأیید شدند (دامنه: $CLEAN_DOMAIN)."
 
           # --- ذخیره DNS پیش‌فرض رانر پیش از تغییر (برای بازیابی خودکار در صورت محدودیت پورت 53) ---
-          ORIG_DNS=$(grep -E '^nameserver ' /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null | awk '{print $2}' | grep -v '^127\.' | sort -u | head -n 2)
+          ORIG_DNS=$(grep -h -E '^nameserver ' /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null | awk '{print $2}' | grep -v '^127\.' | sort -u | head -n 2)
 
           # --- تثبیت DNS بدون چرخش با تست سلامت فوری ---
           sudo systemctl stop systemd-resolved 2>/dev/null || true
